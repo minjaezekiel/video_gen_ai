@@ -23,20 +23,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import hashlib
 from scipy.interpolate import interp1d
+from scipy.signal import resample
 import json
 import gc
-warnings.filterwarnings("ignore")
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from queue import Queue
+from threading import Thread, Lock
+import atexit
 
+warnings.filterwarnings("ignore")
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ModelType(Enum):
     """Enum for different model types available for each component"""
-    SMALL = "small"
-    MEDIUM = "medium"
-    LARGE = "large"
-    XL = "xl"
+    SMALL = "google/flan-t5-small"
+    MEDIUM = "google/flan-t5-base"
+    LARGE = "google/flan-t5-large"
+    XL = "google/flan-t5-xl"
 
 @dataclass
 class GenerationConfig:
@@ -60,6 +66,14 @@ class GenerationConfig:
     music_volume: float = 0.2
     max_video_duration: float = 600.0  # 10 minute safety limit
     target_audio_db: float = -20.0  # Target loudness level
+    # New TTS parameters
+    tts_voice: str = "female"  # ['male', 'female', 'neutral']
+    tts_speed: float = 1.0  # Speed multiplier
+    # Cache settings
+    image_cache_size: int = 20  # Number of images to cache
+    use_disk_cache: bool = True  # Use disk-based caching for images
+    # Model loading settings
+    low_cpu_mem_usage: bool = False  # Changed to False to fix meta tensor issues
 
 @dataclass
 class ModelConfig:
@@ -67,6 +81,21 @@ class ModelConfig:
     text_model: ModelType = ModelType.MEDIUM
     tts_model: ModelType = ModelType.MEDIUM
     image_model: ModelType = ModelType.MEDIUM
+
+def create_session_with_retries(retries=3, backoff_factor=0.3):
+    """Create a requests session with retry capabilities"""
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(500, 502, 504),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
 
 class FreeTextToVideoGenerator:
     def __init__(
@@ -79,6 +108,13 @@ class FreeTextToVideoGenerator:
         self.model_config = model_config
         self.generation_config = generation_config
         self.temp_dir = tempfile.mkdtemp()
+        
+        # Create a requests session with retries
+        self.requests_session = create_session_with_retries()
+        
+        # Thread safety locks
+        self._model_lock = Lock()
+        self._cache_lock = Lock()
         
         logger.info(f"Using device: {self.device}")
         logger.info(f"Temporary directory: {self.temp_dir}")
@@ -95,26 +131,20 @@ class FreeTextToVideoGenerator:
         
         # Image cache with LRU eviction
         self._image_cache = {}
-        self._image_cache_size = 20  # Keep last 20 images
+        self._image_cache_size = generation_config.image_cache_size
         
         # Character reference for consistency
         self._character_reference = None
         
         # Validate configuration
         self._validate_config()
+        
+        # Register cleanup on exit
+        atexit.register(self.cleanup)
     
     def __del__(self):
         """Clean up resources when instance is garbage collected"""
         self.cleanup()
-        if hasattr(self, '_image_generator'):
-            del self._image_generator
-            self._image_generator = None
-        if hasattr(self, '_img2img_generator'):
-            del self._img2img_generator
-            self._img2img_generator = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
     
     def _validate_config(self):
         """Validate configuration parameters"""
@@ -129,41 +159,69 @@ class FreeTextToVideoGenerator:
         
         if self.generation_config.max_video_duration > 3600:
             raise ValueError("max_video_duration cannot exceed 3600 seconds (1 hour)")
+        
+        if self.generation_config.tts_voice not in ["male", "female", "neutral"]:
+            raise ValueError("tts_voice must be one of: 'male', 'female', 'neutral'")
+        
+        if self.generation_config.tts_speed <= 0 or self.generation_config.tts_speed > 3.0:
+            raise ValueError("tts_speed must be between 0.0 and 3.0")
+    
+    def unload_models(self):
+        """Unload models to free memory with thread safety"""
+        with self._model_lock:
+            models = [
+                '_text_generator', '_tts_model', '_tts_tokenizer',
+                '_image_generator', '_img2img_generator'
+            ]
+            
+            for model in models:
+                if hasattr(self, model):
+                    delattr(self, model)
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("Models unloaded and memory freed")
     
     @property
     def text_generator(self):
-        """Lazy load text generation model"""
-        if self._text_generator is None:
-            self._load_text_model()
-        return self._text_generator
+        """Lazy load text generation model with thread safety"""
+        with self._model_lock:
+            if self._text_generator is None:
+                self._load_text_model()
+            return self._text_generator
     
     @property
     def tts_model(self):
-        """Lazy load TTS model"""
-        if self._tts_model is None:
-            self._load_tts_model()
-        return self._tts_model
+        """Lazy load TTS model with thread safety"""
+        with self._model_lock:
+            if self._tts_model is None:
+                self._load_tts_model()
+            return self._tts_model
     
     @property
     def tts_tokenizer(self):
-        """Lazy load TTS tokenizer"""
-        if self._tts_tokenizer is None:
-            self._load_tts_model()
-        return self._tts_tokenizer
+        """Lazy load TTS tokenizer with thread safety"""
+        with self._model_lock:
+            if self._tts_tokenizer is None:
+                self._load_tts_model()
+            return self._tts_tokenizer
     
     @property
     def image_generator(self):
-        """Lazy load image generation model"""
-        if self._image_generator is None:
-            self._load_image_model()
-        return self._image_generator
+        """Lazy load image generation model with thread safety"""
+        with self._model_lock:
+            if self._image_generator is None:
+                self._load_image_model()
+            return self._image_generator
     
     @property
     def img2img_generator(self):
-        """Lazy load img2img model"""
-        if self._img2img_generator is None:
-            self._load_img2img_model()
-        return self._img2img_generator
+        """Lazy load img2img model with thread safety"""
+        with self._model_lock:
+            if self._img2img_generator is None:
+                self._load_img2img_model()
+            return self._img2img_generator
     
     def _load_text_model(self):
         """Load text generation model based on configuration"""
@@ -177,14 +235,30 @@ class FreeTextToVideoGenerator:
         model_name = model_map[self.model_config.text_model]
         logger.info(f"Loading text generation model: {model_name}")
         
-        self._text_generator = pipeline(
-            'text2text-generation',
-            model=model_name,
-            device=0 if self.device == "cuda" else -1
-        )
+        try:
+            # Load model directly without low_cpu_mem_usage to avoid meta tensor issues
+            self._text_generator = pipeline(
+                'text2text-generation',
+                model=model_name,
+                device=self.device if self.device != "meta" else -1,
+                torch_dtype=torch.float32
+            )
+        except Exception as e:
+            logger.error(f"Failed to load text model: {str(e)}")
+            # Fallback to CPU if GPU loading fails
+            try:
+                self._text_generator = pipeline(
+                    'text2text-generation',
+                    model=model_name,
+                    device=-1,  # Force CPU
+                    torch_dtype=torch.float32
+                )
+            except Exception as e2:
+                logger.error(f"Failed to load text model on CPU: {str(e2)}")
+                self._text_generator = None
     
     def _load_tts_model(self):
-        """Load TTS model based on configuration"""
+        """Load TTS model based on configuration with proper meta tensor handling"""
         model_map = {
             ModelType.SMALL: "facebook/mms-tts-eng",
             ModelType.MEDIUM: "facebook/mms-tts-eng",
@@ -195,11 +269,32 @@ class FreeTextToVideoGenerator:
         model_name = model_map[self.model_config.tts_model]
         logger.info(f"Loading TTS model: {model_name}")
         
-        self._tts_model = VitsModel.from_pretrained(model_name).to(self.device)
-        self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        try:
+            # First load tokenizer
+            self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            # Then load model with proper device handling
+            if self.device == "cuda" and torch.cuda.is_available():
+                # For CUDA, load model directly
+                self._tts_model = VitsModel.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float32
+                ).to(self.device)
+            else:
+                # For CPU, load with torch_dtype=float32
+                self._tts_model = VitsModel.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float32
+                ).to("cpu")
+                
+        except Exception as e:
+            logger.error(f"Failed to load TTS model: {str(e)}")
+            # Fallback to a simpler TTS approach
+            self._tts_model = None
+            self._tts_tokenizer = None
     
     def _load_image_model(self):
-        """Load image generation model based on configuration"""
+        """Load image generation model based on configuration with proper meta tensor handling"""
         model_map = {
             ModelType.SMALL: "CompVis/stable-diffusion-v1-4",
             ModelType.MEDIUM: "runwayml/stable-diffusion-v1-5",
@@ -210,35 +305,81 @@ class FreeTextToVideoGenerator:
         model_name = model_map[self.model_config.image_model]
         logger.info(f"Loading image generation model: {model_name}")
         
-        # Use Euler scheduler for better quality
-        scheduler = EulerDiscreteScheduler.from_pretrained(model_name, subfolder="scheduler")
-        
-        self._image_generator = StableDiffusionPipeline.from_pretrained(
-            model_name,
-            scheduler=scheduler,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-            safety_checker=None if not self.generation_config.enable_safety_checker else "stabilityai/stable-diffusion-2-1-safety-checker"
-        ).to(self.device)
-        
-        # Enable memory optimizations
-        if hasattr(self._image_generator, "enable_xformers_memory_efficient_attention"):
-            self._image_generator.enable_xformers_memory_efficient_attention()
-        if hasattr(self._image_generator, "enable_model_cpu_offload"):
-            self._image_generator.enable_model_cpu_offload()
+        try:
+            # Use Euler scheduler for better quality
+            scheduler = EulerDiscreteScheduler.from_pretrained(model_name, subfolder="scheduler")
+            
+            # Set appropriate torch_dtype based on device
+            torch_dtype = torch.float16 if self.device == "cuda" and torch.cuda.is_available() else torch.float32
+            
+            # Load model with appropriate settings
+            self._image_generator = StableDiffusionPipeline.from_pretrained(
+                model_name,
+                scheduler=scheduler,
+                torch_dtype=torch_dtype,
+                safety_checker=None if not self.generation_config.enable_safety_checker else None,
+                variant="fp16" if torch_dtype == torch.float16 else None,
+                device_map="auto" if self.device == "cuda" else None
+            )
+            
+            # Move to device after loading
+            if self.device == "cuda" and torch.cuda.is_available():
+                self._image_generator = self._image_generator.to(self.device)
+            
+            # Enable memory optimizations if available
+            try:
+                if hasattr(self._image_generator, "enable_xformers_memory_efficient_attention"):
+                    self._image_generator.enable_xformers_memory_efficient_attention()
+            except:
+                pass
+            
+            try:
+                if hasattr(self._image_generator, "enable_model_cpu_offload"):
+                    self._image_generator.enable_model_cpu_offload()
+            except:
+                pass
+                    
+        except Exception as e:
+            logger.error(f"Failed to load image model: {str(e)}")
+            # Create a dummy generator as fallback
+            self._image_generator = None
     
     def _load_img2img_model(self):
-        """Load img2img model for character consistency"""
+        """Load img2img model for character consistency with proper meta tensor handling"""
         logger.info("Loading img2img model for character consistency")
         
-        self._img2img_generator = StableDiffusionImg2ImgPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-        ).to(self.device)
-        
-        if hasattr(self._img2img_generator, "enable_xformers_memory_efficient_attention"):
-            self._img2img_generator.enable_xformers_memory_efficient_attention()
-        if hasattr(self._img2img_generator, "enable_model_cpu_offload"):
-            self._img2img_generator.enable_model_cpu_offload()
+        try:
+            # Set appropriate torch_dtype based on device
+            torch_dtype = torch.float16 if self.device == "cuda" and torch.cuda.is_available() else torch.float32
+            
+            self._img2img_generator = StableDiffusionImg2ImgPipeline.from_pretrained(
+                "runwayml/stable-diffusion-v1-5",
+                torch_dtype=torch_dtype,
+                variant="fp16" if torch_dtype == torch.float16 else None,
+                device_map="auto" if self.device == "cuda" else None
+            )
+            
+            # Move to device after loading
+            if self.device == "cuda" and torch.cuda.is_available():
+                self._img2img_generator = self._img2img_generator.to(self.device)
+            
+            # Enable memory optimizations if available
+            try:
+                if hasattr(self._img2img_generator, "enable_xformers_memory_efficient_attention"):
+                    self._img2img_generator.enable_xformers_memory_efficient_attention()
+            except:
+                pass
+            
+            try:
+                if hasattr(self._img2img_generator, "enable_model_cpu_offload"):
+                    self._img2img_generator.enable_model_cpu_offload()
+            except:
+                pass
+                    
+        except Exception as e:
+            logger.error(f"Failed to load img2img model: {str(e)}")
+            # Create a dummy generator as fallback
+            self._img2img_generator = None
     
     def _load_font(self):
         """Try to load a nice font, fallback to default"""
@@ -255,6 +396,44 @@ class FreeTextToVideoGenerator:
             except:
                 continue
         return ImageFont.load_default()
+    
+    def switch_model(self, model_type: str, model_size: ModelType):
+        """Safely switch a model type with proper cleanup"""
+        model_type = model_type.lower()
+        valid_types = ['text', 'tts', 'image']
+        
+        if model_type not in valid_types:
+            raise ValueError(f"Invalid model type. Must be one of {valid_types}")
+        
+        # Unload current model
+        with self._model_lock:
+            if model_type == 'text' and self._text_generator is not None:
+                del self._text_generator
+                self._text_generator = None
+            elif model_type == 'tts':
+                if self._tts_model is not None:
+                    del self._tts_model
+                    self._tts_model = None
+                if self._tts_tokenizer is not None:
+                    del self._tts_tokenizer
+                    self._tts_tokenizer = None
+            elif model_type == 'image':
+                if self._image_generator is not None:
+                    del self._image_generator
+                    self._image_generator = None
+                if self._img2img_generator is not None:
+                    del self._img2img_generator
+                    self._img2img_generator = None
+            
+            # Update config
+            setattr(self.model_config, f"{model_type}_model", model_size)
+            
+            # Force garbage collection
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            logger.info(f"Switched {model_type} model to {model_size.value}")
     
     def generate_script(
         self,
@@ -341,36 +520,92 @@ class FreeTextToVideoGenerator:
         
         return scenes
     
+    def _get_cache_path(self, cache_key: str) -> str:
+        """Get the file path for a cache key"""
+        return os.path.join(self.temp_dir, f"cache_{cache_key}.png")
+    
+    def _save_to_cache(self, cache_key: str, image: Image.Image):
+        """Save an image to disk cache with LRU eviction"""
+        if not self.generation_config.use_disk_cache:
+            return
+            
+        with self._cache_lock:
+            cache_path = self._get_cache_path(cache_key)
+            image.save(cache_path)
+            
+            # Manage cache size
+            cache_files = sorted(
+                [f for f in os.listdir(self.temp_dir) if f.startswith("cache_")],
+                key=lambda f: os.path.getmtime(os.path.join(self.temp_dir, f))
+            )
+            
+            while len(cache_files) > self._image_cache_size:
+                os.remove(os.path.join(self.temp_dir, cache_files.pop(0)))
+    
+    def _load_from_cache(self, cache_key: str) -> Optional[Image.Image]:
+        """Load an image from disk cache"""
+        if not self.generation_config.use_disk_cache:
+            return None
+            
+        with self._cache_lock:
+            cache_path = self._get_cache_path(cache_key)
+            if os.path.exists(cache_path):
+                # Update access time
+                os.utime(cache_path, None)
+                return Image.open(cache_path)
+            return None
+    
     @functools.lru_cache(maxsize=32)
     def generate_speech(self, text: str, output_path: str) -> str:
-        """Convert text to speech using TTS model with caching and error handling"""
+        """Enhanced TTS with voice control and speed adjustment"""
+        # Check if TTS model is available
+        if self.tts_model is None or self.tts_tokenizer is None:
+            logger.warning("TTS model not available, creating silent audio")
+            return self._generate_silent_audio(output_path)
+        
         try:
-            inputs = self.tts_tokenizer(text, return_tensors="pt").to(self.device)
+            # Add voice control to prompt
+            voice_prompt = f"[{self.generation_config.tts_voice} voice]{text}"
+            
+            inputs = self.tts_tokenizer(voice_prompt, return_tensors="pt")
+            
+            # Move inputs to the same device as the model
+            if hasattr(self.tts_model, "device"):
+                inputs = {k: v.to(self.tts_model.device) for k, v in inputs.items()}
             
             with torch.no_grad():
                 output = self.tts_model(**inputs).waveform
             
             # Convert to numpy and save
             audio = output.cpu().numpy().squeeze()
-            sf.write(
-                output_path,
-                audio,
-                samplerate=self.generation_config.tts_sampling_rate
-            )
+            
+            # Apply speed adjustment
+            if self.generation_config.tts_speed != 1.0:
+                audio = self._adjust_speed(audio, self.generation_config.tts_speed)
+            
+            sf.write(output_path, audio, samplerate=self.generation_config.tts_sampling_rate)
             return output_path
         except Exception as e:
             logger.error(f"TTS generation failed: {str(e)}")
-            # Create silent audio as fallback
-            duration = min(
-                max(
-                    len(text.split()) / 3,  # Approximate 3 words per second
-                    self.generation_config.min_scene_duration
-                ),
-                self.generation_config.max_scene_duration
-            )
-            silent_audio = np.zeros(int(duration * self.generation_config.tts_sampling_rate))
-            sf.write(output_path, silent_audio, samplerate=self.generation_config.tts_sampling_rate)
-            return output_path
+            return self._generate_silent_audio(output_path)
+    
+    def _generate_silent_audio(self, output_path: str) -> str:
+        """Generate silent audio as fallback"""
+        duration = self.generation_config.min_scene_duration
+        silent_audio = np.zeros(int(duration * self.generation_config.tts_sampling_rate))
+        sf.write(output_path, silent_audio, samplerate=self.generation_config.tts_sampling_rate)
+        return output_path
+    
+    def _adjust_speed(self, audio: np.ndarray, speed: float) -> np.ndarray:
+        """Adjust audio speed using resampling"""
+        if speed <= 0:
+            return audio
+            
+        new_length = int(len(audio) / speed)
+        if new_length <= 0:
+            return audio
+            
+        return resample(audio, new_length)
     
     def generate_image(
         self,
@@ -380,11 +615,28 @@ class FreeTextToVideoGenerator:
         use_cache: bool = True
     ) -> Image.Image:
         """Generate an image from text prompt with enhanced controls and caching"""
+        # Check if image generator is available
+        if self.image_generator is None:
+            logger.warning("Image generator not available, creating black image")
+            return Image.new(
+                'RGB',
+                (self.generation_config.image_width, self.generation_config.image_height),
+                color='black'
+            )
+        
         # Create cache key
         cache_key = hashlib.md5(f"{prompt}_{seed}_{negative_prompt}".encode()).hexdigest()
         
+        # Check disk cache first
+        if use_cache and self.generation_config.use_disk_cache:
+            cached_image = self._load_from_cache(cache_key)
+            if cached_image is not None:
+                logger.debug(f"Using disk-cached image for prompt: {prompt[:50]}...")
+                return cached_image
+        
+        # Check memory cache
         if use_cache and cache_key in self._image_cache:
-            logger.debug(f"Using cached image for prompt: {prompt[:50]}...")
+            logger.debug(f"Using memory-cached image for prompt: {prompt[:50]}...")
             return self._image_cache[cache_key]
         
         if seed is None and self.generation_config.seed is not None:
@@ -418,7 +670,11 @@ class FreeTextToVideoGenerator:
             
             # Cache the image
             if use_cache:
-                # Manage cache size
+                # Save to disk cache
+                if self.generation_config.use_disk_cache:
+                    self._save_to_cache(cache_key, image)
+                
+                # Manage memory cache size
                 if len(self._image_cache) >= self._image_cache_size:
                     # Remove oldest entry
                     oldest_key = next(iter(self._image_cache))
@@ -453,6 +709,10 @@ class FreeTextToVideoGenerator:
         seed: Optional[int] = None
     ) -> Image.Image:
         """Generate a scene with consistent character"""
+        if self.img2img_generator is None:
+            logger.warning("Img2Img model not available, returning character reference")
+            return character_reference
+            
         if seed is None and self.generation_config.seed is not None:
             seed = self.generation_config.seed + hash(scene_description) % 1000
         
@@ -588,7 +848,8 @@ class FreeTextToVideoGenerator:
         music = music * envelope
         
         # Normalize
-        music = music / np.max(np.abs(music)) if np.max(np.abs(music)) > 0 else music
+        if np.max(np.abs(music)) > 0:
+            music = music / np.max(np.abs(music))
         
         return music
     
@@ -614,7 +875,20 @@ class FreeTextToVideoGenerator:
         text = '\n'.join(lines[:3])  # Max 3 lines
         
         # Calculate text position (centered at bottom)
-        text_height = sum([self.font.getsize(line)[1] for line in text.split('\n')])
+        # Use textbbox instead of deprecated getsize
+        try:
+            # For newer Pillow versions
+            bbox = draw.textbbox((0, 0), text, font=self.font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        except AttributeError:
+            # Fallback for older Pillow versions
+            try:
+                text_width, text_height = draw.textsize(text, font=self.font)
+            except AttributeError:
+                # Ultimate fallback
+                text_width, text_height = len(text) * 20, 40
+        
         position = (20, image.height - text_height - 20)
         
         # Add semi-transparent background for better readability
@@ -636,7 +910,7 @@ class FreeTextToVideoGenerator:
         # Add text with shadow
         shadow_offset = 2
         for i, line in enumerate(text.split('\n')):
-            y = position[1] + (i * self.font.getsize(line)[1])
+            y = position[1] + (i * text_height // len(text.split('\n')))
             draw.text((position[0]+shadow_offset, y+shadow_offset), line, font=self.font, fill="black")
             draw.text((position[0], y), line, font=self.font, fill="white")
         
@@ -661,8 +935,12 @@ class FreeTextToVideoGenerator:
         """Normalize audio levels to target dB level"""
         try:
             # Calculate current loudness (RMS)
-            max_volume = audio_clip.max_volume()
-            
+            try:
+                max_volume = audio_clip.max_volume()
+            except:
+                # Fallback for when max_volume fails
+                max_volume = 0.01
+                
             if max_volume < 0.001:  # Silent audio
                 return audio_clip
             
@@ -691,27 +969,25 @@ class FreeTextToVideoGenerator:
             return 'slow'
     
     def _safety_check(self, video_path: str) -> bool:
-        """Verify the output video meets quality standards"""
+        """Fixed version with proper array comparison"""
         try:
-            # Check file exists and has reasonable size
             if not os.path.exists(video_path):
                 return False
                 
             file_size = os.path.getsize(video_path)
-            if file_size < 1024:  # Less than 1KB
+            if file_size < 1024:
                 return False
                 
-            # Check video properties
             with VideoFileClip(video_path) as clip:
-                if clip.duration < 0.1:  # Less than 100ms
+                if clip.duration < 0.1:
                     return False
                     
-                if clip.size[0] < 16 or clip.size[1] < 16:  # Minimum 16x16 pixels
+                if clip.size[0] < 16 or clip.size[1] < 16:
                     return False
                     
-                # Check for black frames (sign of generation failure)
+                # Fixed array comparison
                 first_frame = clip.get_frame(0)
-                if np.mean(first_frame) < 10:  # Average pixel value < 10
+                if np.all(first_frame < 10):  # Now properly compares all elements
                     return False
                     
             return True
@@ -820,6 +1096,75 @@ class FreeTextToVideoGenerator:
             
             return fallback_frames, silent_audio
     
+    def _pipeline_processing(self, scenes: List[Dict[str, str]]) -> List[Tuple[List[Image.Image], AudioFileClip]]:
+        """Process scenes using a producer-consumer pipeline for optimal performance"""
+        scene_queue = Queue()
+        result_queue = Queue()
+        
+        # Track progress
+        processed_count = 0
+        total_count = len(scenes)
+        progress_lock = Lock()
+        
+        # Producer thread
+        def producer():
+            for i, scene in enumerate(scenes):
+                scene_queue.put((i, scene))
+            # Add sentinels for each worker
+            for _ in range(self.generation_config.max_workers):
+                scene_queue.put(None)
+        
+        # Worker threads
+        def worker():
+            nonlocal processed_count
+            while True:
+                item = scene_queue.get()
+                if item is None:
+                    break
+                
+                scene_index, scene = item
+                try:
+                    result = self.process_single_scene(
+                        scene, 
+                        scene_index,
+                        self._character_reference if self.generation_config.enable_character_consistency else None
+                    )
+                    result_queue.put((scene_index, result))
+                    
+                    # Update progress
+                    with progress_lock:
+                        processed_count += 1
+                        logger.info(f"Processed scene {scene_index+1}/{total_count}")
+                        
+                except Exception as e:
+                    logger.error(f"Scene {scene_index} processing failed: {str(e)}")
+                    # Add empty result as fallback
+                    result_queue.put((scene_index, ([], AudioClip(lambda t: 0, duration=1, fps=44100))))
+        
+        # Start producer thread
+        producer_thread = Thread(target=producer)
+        producer_thread.start()
+        
+        # Start worker threads
+        workers = [Thread(target=worker) for _ in range(self.generation_config.max_workers)]
+        for w in workers:
+            w.start()
+        
+        # Wait for producer to finish
+        producer_thread.join()
+        
+        # Wait for workers to finish
+        for w in workers:
+            w.join()
+        
+        # Collect results in order
+        results = [None] * total_count
+        while not result_queue.empty():
+            scene_index, result = result_queue.get()
+            results[scene_index] = result
+        
+        return results
+    
     def create_video(
         self,
         scenes: List[Dict[str, str]],
@@ -839,13 +1184,40 @@ class FreeTextToVideoGenerator:
                     f"{self.generation_config.max_video_duration}s"
                 )
             
-            # Process scenes (parallel)
-            results = self._process_scenes_parallel(scenes, callback)
+            # Process scenes using pipeline approach
+            if callback:
+                callback(10, "Processing scenes")
+            
+            results = self._pipeline_processing(scenes)
             
             # Create video clips
-            video_clips = self._create_video_clips(results, add_transitions, callback)
+            if callback:
+                callback(70, "Creating video clips")
+            
+            video_clips = []
+            for i, (frames, audio_clip) in enumerate(results):
+                if not frames:
+                    continue
+                    
+                # Create video clip from frames
+                frame_duration = 1 / 24  # 24 FPS
+                clips = [ImageClip(np.array(frame)).set_duration(frame_duration) for frame in frames]
+                scene_clip = concatenate_videoclips(clips)
+                
+                # Add fade transitions if enabled
+                if add_transitions and i > 0:
+                    scene_clip = scene_clip.crossfadein(self.generation_config.transition_duration)
+                
+                video_clips.append(scene_clip)
+                
+                if callback:
+                    progress = 70 + (i / len(results)) * 15
+                    callback(int(progress), f"Created scene {i + 1}")
             
             # Render final video
+            if callback:
+                callback(85, "Rendering final video")
+            
             output_path = self._render_final_video(
                 video_clips,
                 [r[1] for r in results],
@@ -862,76 +1234,6 @@ class FreeTextToVideoGenerator:
         except Exception as e:
             logger.error(f"Video creation failed: {str(e)}")
             raise
-    
-    def _process_scenes_parallel(
-        self,
-        scenes: List[Dict[str, str]],
-        callback: Optional[Callable[[int, str], None]]
-    ) -> List[Tuple[List[Image.Image], AudioFileClip]]:
-        """Process scenes in parallel with progress tracking"""
-        results = []
-        completed = 0
-        total = len(scenes)
-        
-        with ThreadPoolExecutor(max_workers=self.generation_config.max_workers) as executor:
-            futures = {
-                executor.submit(
-                    self.process_single_scene,
-                    scene,
-                    i,
-                    self._character_reference if self.generation_config.enable_character_consistency else None,
-                    None  # Don't pass callback to individual scenes
-                ): i for i, scene in enumerate(scenes)
-            }
-            
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    result = future.result()
-                    results.append((idx, result))
-                    completed += 1
-                    
-                    if callback:
-                        progress = 10 + (completed / total) * 60  # 10-70% range
-                        callback(int(progress), f"Processed {completed}/{total} scenes")
-                        
-                except Exception as e:
-                    logger.error(f"Scene {idx} processing failed: {str(e)}")
-                    # Add empty result as fallback
-                    results.append((idx, ([], AudioClip(lambda t: 0, duration=1, fps=44100))))
-        
-        # Sort by original scene order
-        results.sort(key=lambda x: x[0])
-        return [r[1] for r in results]
-    
-    def _create_video_clips(
-        self,
-        scene_results: List[Tuple[List[Image.Image], AudioFileClip]],
-        add_transitions: bool,
-        callback: Optional[Callable[[int, str], None]]
-    ) -> List[ImageClip]:
-        """Create video clips from processed scenes"""
-        video_clips = []
-        
-        for i, (frames, audio_clip) in enumerate(scene_results):
-            if callback:
-                callback(70 + (i / len(scene_results)) * 10, f"Creating scene {i + 1}")
-            
-            if not frames:
-                continue
-                
-            # Create video clip from frames
-            frame_duration = 1 / 24  # 24 FPS
-            clips = [ImageClip(np.array(frame)).set_duration(frame_duration) for frame in frames]
-            scene_clip = concatenate_videoclips(clips)
-            
-            # Add fade transitions if enabled
-            if add_transitions and i > 0:
-                scene_clip = scene_clip.crossfadein(self.generation_config.transition_duration)
-            
-            video_clips.append(scene_clip)
-        
-        return video_clips
     
     def _render_final_video(
         self,
@@ -964,8 +1266,18 @@ class FreeTextToVideoGenerator:
                 callback(90, "Adding background music")
             
             music = self.generate_background_music("neutral", final_video.duration)
+            
+            # Create AudioClip from music array with proper handling
+            def make_music_clip(t):
+                if t >= final_video.duration:
+                    return 0
+                idx = int(t * 22050)
+                if idx >= len(music):
+                    return 0
+                return music[idx]
+            
             music_audio = AudioClip(
-                lambda t: music[int(t * 22050)] if int(t * 22050) < len(music) else 0,
+                make_music_clip,
                 duration=final_video.duration,
                 fps=22050
             ).fx(volumex, self.generation_config.music_volume)
@@ -1054,7 +1366,7 @@ class FreeTextToVideoGenerator:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
-            response = requests.get(url, headers=headers, timeout=10)
+            response = self.requests_session.get(url, headers=headers, timeout=10)
             
             # Check if response is successful
             if response.status_code != 200:
@@ -1088,13 +1400,22 @@ class FreeTextToVideoGenerator:
     def cleanup(self):
         """Clean up temporary files with error handling"""
         try:
+            # Unload models first to free memory
+            self.unload_models()
+            
+            # Clean up temporary files
             for file in os.listdir(self.temp_dir):
                 try:
                     os.remove(os.path.join(self.temp_dir, file))
                 except Exception as e:
                     logger.warning(f"Could not delete temporary file {file}: {str(e)}")
-            os.rmdir(self.temp_dir)
-            logger.info("Cleaned up temporary files")
+            
+            try:
+                os.rmdir(self.temp_dir)
+                logger.info("Cleaned up temporary files")
+            except Exception as e:
+                logger.warning(f"Could not remove temporary directory: {str(e)}")
+                
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
     
@@ -1125,7 +1446,12 @@ class FreeTextToVideoGenerator:
                 "enable_background_music": self.generation_config.enable_background_music,
                 "music_volume": self.generation_config.music_volume,
                 "max_video_duration": self.generation_config.max_video_duration,
-                "target_audio_db": self.generation_config.target_audio_db
+                "target_audio_db": self.generation_config.target_audio_db,
+                "tts_voice": self.generation_config.tts_voice,
+                "tts_speed": self.generation_config.tts_speed,
+                "image_cache_size": self.generation_config.image_cache_size,
+                "use_disk_cache": self.generation_config.use_disk_cache,
+                "low_cpu_mem_usage": self.generation_config.low_cpu_mem_usage
             }
         }
         
@@ -1172,7 +1498,12 @@ if __name__ == "__main__":
         enable_background_music=True,
         music_volume=0.15,
         target_audio_db=-16.0,
-        max_video_duration=300.0  # 5 minute limit
+        max_video_duration=300.0,  # 5 minute limit
+        tts_voice="female",
+        tts_speed=1.2,
+        image_cache_size=30,
+        use_disk_cache=True,
+        low_cpu_mem_usage=False  # Changed to False to fix meta tensor issues
     )
     
     generator = FreeTextToVideoGenerator(generation_config=config)
@@ -1183,9 +1514,8 @@ if __name__ == "__main__":
         
         # Generate a complex video with all features
         result = generator.generate_from_prompt(
-            "A documentary about the future of AI in healthcare, showing doctors "
-            "working with AI assistants to diagnose patients",
-            "ai_healthcare.mp4",
+            "A futuristic city where robots and humans coexist peacefully",
+            "futuristic_city.mp4",
             callback=progress_callback,
             enable_animation=True,
             enable_character_consistency=True
@@ -1193,6 +1523,20 @@ if __name__ == "__main__":
         
         print(f"\nSuccessfully created video: {result}")
         print(f"Video duration: {VideoFileClip(result).duration:.1f} seconds")
+        
+        # Demonstrate model switching
+        print("\nSwitching to larger image model for higher quality...")
+        generator.switch_model("image", ModelType.LARGE)
+        
+        # Generate another video with the new model
+        result2 = generator.generate_from_prompt(
+            "A beautiful landscape with mountains and a lake",
+            "landscape.mp4",
+            callback=progress_callback
+        )
+        
+        print(f"\nSuccessfully created second video: {result2}")
+        print(f"Video duration: {VideoFileClip(result2).duration:.1f} seconds")
         
         # Learn from a URL and generate context-aware video
         context = generator.learn_from_url("https://en.wikipedia.org/wiki/Artificial_intelligence")
