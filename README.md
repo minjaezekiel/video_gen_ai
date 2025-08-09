@@ -54,9 +54,10 @@ brew install ffmpeg
 
 ## Quick Start
 
-### Basic Usage
+### Basic Usage 
+-Use the test.py file instead, you can change the prompts from there...
 ```python
-from free_text_to_video import FreeTextToVideoGenerator, GenerationConfig
+from video_generator import FreeTextToVideoGenerator, GenerationConfig
 
 # Initialize generator with custom configuration
 config = GenerationConfig(
@@ -568,7 +569,7 @@ python generate_video.py "A magical forest with glowing mushrooms" --output fore
 
 ### Jupyter Notebook Integration
 ```python
-from free_text_to_video import FreeTextToVideoGenerator, GenerationConfig
+from video_generator import FreeTextToVideoGenerator, GenerationConfig
 from IPython.display import Video
 
 # Initialize generator
@@ -681,7 +682,8 @@ We welcome contributions to improve FreeTextToVideoGenerator! Here's how you can
 4. **Audio Features**: Add more sophisticated music generation and sound effects
 5. **UI/UX Improvements**: Enhance web interfaces and user experience
 6. **Documentation**: Improve tutorials and API documentation
-7. **Testing**: Expand test coverage for better reliability
+7. **Fix bugs/errors**: Fix any bugs or errors attributed to the project
+8. **Testing**: Expand test coverage for better reliability
 
 ### Submitting Changes
 1. Commit your changes:
