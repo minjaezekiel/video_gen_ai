@@ -1,2 +1,23 @@
+# environments
 env
 .env
+.venv/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# generated artefacts
+output/
+.cache/
+*.mp4
+
+# scripts in video_scripts/ ARE tracked on purpose -- they are the record of
+# what was generated. Only the self-test's throwaway script is ignored.
+video_scripts/self-test.md
+
+# os
+.DS_Store

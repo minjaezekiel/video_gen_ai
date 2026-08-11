@@ -1,1560 +1,1751 @@
-import os
-import torch
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM, VitsModel, AutoTokenizer
-from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline, EulerDiscreteScheduler
-import soundfile as sf
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip, VideoFileClip
-from moviepy.video.fx.all import fadein, fadeout, speedx
-from moviepy.audio.fx.all import volumex
-from moviepy.audio.AudioClip import AudioClip
-import tempfile
-import requests
-from bs4 import BeautifulSoup
-import re
-import warnings
-from typing import List, Dict, Optional, Union, Callable, Tuple
-from dataclasses import dataclass, field
-import logging
-from enum import Enum
-import functools
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-import hashlib
-from scipy.interpolate import interp1d
-from scipy.signal import resample
-import json
-import gc
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from queue import Queue
-from threading import Thread, Lock
+#!/usr/bin/env python3
+"""
+Story -> script -> video generator, optimised for CPU-only and offline use.
+
+The pipeline is deliberately layered so that every stage has a zero-download
+fallback.  With the optional model stack installed (``requirements-ml.txt``)
+scenes are rendered with Stable Diffusion Turbo and narrated with MMS-TTS;
+without it, scenes become procedurally composed cards and narration uses the
+host operating system's speech synthesiser.  Both paths produce a complete,
+playable MP4 -- the difference is fidelity, never functionality.
+
+Usage
+-----
+    python video_generator.py                 # interactive wizard
+    python video_generator.py --self-test     # offline smoke test, no downloads
+    python video_generator.py --story-file s.txt --yes --preset draft
+
+See ``decision.md`` for the engineering rationale and ``roadmap.md`` for what
+is planned next.
+"""
+
+from __future__ import annotations
+
+import argparse
 import atexit
+import hashlib
+import logging
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-warnings.filterwarnings("ignore")
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import numpy as np
+import yaml
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-class ModelType(Enum):
-    """Enum for different model types available for each component"""
-    SMALL = "google/flan-t5-small"
-    MEDIUM = "google/flan-t5-base"
-    LARGE = "google/flan-t5-large"
-    XL = "google/flan-t5-xl"
+# The macOS python.org build ships without a root certificate store, which makes
+# every HTTPS request (including Hugging Face downloads) fail with
+# CERTIFICATE_VERIFY_FAILED.  Pointing OpenSSL at certifi fixes it process-wide,
+# and must happen before requests/huggingface_hub are imported.
+try:  # pragma: no cover - environment dependent
+    import certifi
+
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except ImportError:  # pragma: no cover
+    pass
+
+from moviepy import AudioArrayClip, AudioFileClip, CompositeAudioClip, VideoClip
+import moviepy.audio.fx as afx
+
+LOGGER = logging.getLogger("video_gen")
+
+# --------------------------------------------------------------------------- #
+# Optional dependency probing
+#
+# Nothing below is required.  Each flag gates one enhancement; the pipeline has
+# a working path for every combination of them being absent.
+# --------------------------------------------------------------------------- #
+
+try:  # pragma: no cover - depends on install
+    import torch
+
+    HAS_TORCH = True
+except Exception:  # noqa: BLE001 - a broken torch install must not be fatal
+    torch = None  # type: ignore[assignment]
+    HAS_TORCH = False
+
+try:  # pragma: no cover
+    import diffusers  # noqa: F401
+
+    HAS_DIFFUSERS = HAS_TORCH
+except Exception:  # noqa: BLE001
+    HAS_DIFFUSERS = False
+
+try:  # pragma: no cover
+    import transformers  # noqa: F401
+
+    HAS_TRANSFORMERS = HAS_TORCH
+except Exception:  # noqa: BLE001
+    HAS_TRANSFORMERS = False
+
+try:  # pragma: no cover
+    import soundfile as sf
+
+    HAS_SOUNDFILE = True
+except Exception:  # noqa: BLE001
+    sf = None  # type: ignore[assignment]
+    HAS_SOUNDFILE = False
+
+
+def capability_report() -> Dict[str, bool]:
+    """Machine-readable summary of which optional backends are usable."""
+    return {
+        "torch": HAS_TORCH,
+        "diffusers": HAS_DIFFUSERS,
+        "transformers": HAS_TRANSFORMERS,
+        "soundfile": HAS_SOUNDFILE,
+        "system_tts": _system_tts_command() is not None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Presets
+# --------------------------------------------------------------------------- #
+
+#: Rendering presets.  ``steps``/``guidance`` are tuned per model family: the
+#: distilled turbo checkpoints are trained for 1-4 steps with classifier-free
+#: guidance *disabled*, so passing the usual ``guidance_scale=7.5`` and a
+#: negative prompt produces washed-out garbage.  That is why guidance and
+#: negative prompts live in the preset rather than in global settings.
+PRESETS: Dict[str, Dict[str, object]] = {
+    "draft": {
+        "model": "stabilityai/sd-turbo",
+        "steps": 1,
+        "guidance": 0.0,
+        "image_size": 384,
+        "negative_prompt": "",
+        "resolution": (854, 480),
+        "fps": 24,
+        "crf": 23,
+    },
+    "standard": {
+        "model": "stabilityai/sd-turbo",
+        "steps": 4,
+        "guidance": 0.0,
+        "image_size": 512,
+        "negative_prompt": "",
+        "resolution": (1280, 720),
+        "fps": 24,
+        "crf": 20,
+    },
+    "quality": {
+        "model": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        "steps": 25,
+        "guidance": 7.5,
+        "image_size": 768,
+        "negative_prompt": (
+            "blurry, low quality, distorted, deformed, watermark, text, "
+            "signature, jpeg artifacts, extra limbs"
+        ),
+        "resolution": (1920, 1080),
+        "fps": 30,
+        "crf": 18,
+    },
+}
+
+DEFAULT_PRESET = "standard"
+
+#: Candidate treatments.  Three *different* pacings beat three samples of one
+#: model: small models resampled three times give three near-identical outputs,
+#: which makes the accept step meaningless.
+VARIANTS: Dict[str, Dict[str, object]] = {
+    "Cinematic": {
+        "scenes": (4, 5),
+        "wpm": 130,
+        "style": (
+            "cinematic wide shot, anamorphic lens, dramatic volumetric lighting, "
+            "shallow depth of field, film grain, muted teal and amber palette"
+        ),
+        "feel": "Wide establishing shots, slower narration, longer holds.",
+    },
+    "Fast-cut": {
+        "scenes": (7, 8),
+        "wpm": 165,
+        "style": (
+            "dynamic close-up, bold saturated colours, high contrast, "
+            "strong diagonal composition, crisp detail"
+        ),
+        "feel": "Punchy and quick; many short scenes, energetic narration.",
+    },
+    "Documentary": {
+        "scenes": (5, 6),
+        "wpm": 145,
+        "style": (
+            "natural available light, documentary photography, 35mm lens, "
+            "realistic texture, neutral colour grade"
+        ),
+        "feel": "Measured and explanatory; evenly weighted scenes.",
+    },
+}
+
+MIN_SCENE_SECONDS = 2.5
+MAX_SCENE_SECONDS = 12.0
+SCENE_TAIL_PAD = 0.55  # breathing room after narration ends
+CROSSFADE_SECONDS = 0.4
+
+
+# --------------------------------------------------------------------------- #
+# Data model
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Scene:
+    """A single shot: one generated still, one line of narration."""
+
+    index: int
+    visual: str
+    narration: str
+    duration: float = MIN_SCENE_SECONDS
+    overlay: str = ""
+
+    def to_markdown(self) -> str:
+        parts = [f"## Scene {self.index} — {self.duration:.1f}s", ""]
+        parts.append(f"**Visual:** {self.visual}")
+        parts.append("")
+        parts.append(f"**Narration:** {self.narration}")
+        if self.overlay:
+            parts.append("")
+            parts.append(f"**Overlay:** {self.overlay}")
+        return "\n".join(parts)
+
+
+@dataclass
+class VideoScript:
+    """A candidate or accepted script, persisted as ``video_scripts/<id>.md``."""
+
+    id: str
+    title: str
+    variant: str
+    scenes: List[Scene]
+    source_story: str = ""
+    status: str = "candidate"  # candidate -> accepted -> rendered
+    created: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    config: Dict[str, object] = field(default_factory=dict)
+    renders: List[Dict[str, object]] = field(default_factory=list)
+
+    @property
+    def estimated_duration(self) -> float:
+        return sum(s.duration for s in self.scenes)
+
+    def to_markdown(self) -> str:
+        front = {
+            "id": self.id,
+            "title": self.title,
+            "variant": self.variant,
+            "status": self.status,
+            "created": self.created,
+            "source_story": self.source_story,
+            "config": self.config,
+            "renders": self.renders,
+        }
+        header = yaml.safe_dump(front, sort_keys=False, allow_unicode=True, width=88)
+        body = "\n\n".join(s.to_markdown() for s in self.scenes)
+        return f"---\n{header}---\n\n# {self.title}\n\n{body}\n"
+
+    @classmethod
+    def from_markdown(cls, text: str) -> "VideoScript":
+        front, body = _split_frontmatter(text)
+        return cls(
+            id=str(front.get("id", "unknown")),
+            title=str(front.get("title", "Untitled")),
+            variant=str(front.get("variant", "Cinematic")),
+            scenes=_parse_scenes(body),
+            source_story=str(front.get("source_story", "") or ""),
+            status=str(front.get("status", "candidate")),
+            created=str(front.get("created", "")),
+            config=dict(front.get("config") or {}),
+            renders=list(front.get("renders") or []),
+        )
+
 
 @dataclass
 class GenerationConfig:
-    """Configuration for video generation parameters"""
-    video_length: float = 30.0  # Target video length in seconds
-    min_scene_duration: float = 3.0  # Minimum duration per scene
-    max_scene_duration: float = 10.0  # Maximum duration per scene
-    transition_duration: float = 0.5  # Duration of transitions between scenes
-    image_width: int = 768
-    image_height: int = 768
-    image_steps: int = 25
-    image_cfg_scale: float = 7.5
-    tts_sampling_rate: int = 16000
-    text_model_temp: float = 0.7
-    seed: Optional[int] = None
-    enable_safety_checker: bool = False
-    max_workers: int = 4
-    enable_animation: bool = True
-    enable_character_consistency: bool = True
-    enable_background_music: bool = True
-    music_volume: float = 0.2
-    max_video_duration: float = 600.0  # 10 minute safety limit
-    target_audio_db: float = -20.0  # Target loudness level
-    # New TTS parameters
-    tts_voice: str = "female"  # ['male', 'female', 'neutral']
-    tts_speed: float = 1.0  # Speed multiplier
-    # Cache settings
-    image_cache_size: int = 20  # Number of images to cache
-    use_disk_cache: bool = True  # Use disk-based caching for images
-    # Model loading settings
-    low_cpu_mem_usage: bool = False  # Changed to False to fix meta tensor issues
+    """Everything that influences a render, in one place."""
 
-@dataclass
-class ModelConfig:
-    """Configuration for model selection"""
-    text_model: ModelType = ModelType.MEDIUM
-    tts_model: ModelType = ModelType.MEDIUM
-    image_model: ModelType = ModelType.MEDIUM
+    preset: str = DEFAULT_PRESET
+    resolution: Optional[Tuple[int, int]] = None
+    fps: Optional[int] = None
+    seed: int = 1234
+    music: bool = True
+    music_volume: float = 0.12
+    overlays: bool = True
+    use_llm: bool = False
+    voice_rate: float = 1.0
+    output_dir: Path = Path("output")
+    scripts_dir: Path = Path("video_scripts")
+    cache_dir: Path = Path(".cache")
 
-def create_session_with_retries(retries=3, backoff_factor=0.3):
-    """Create a requests session with retry capabilities"""
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=(500, 502, 504),
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
+    def __post_init__(self) -> None:
+        if self.preset not in PRESETS:
+            raise ValueError(f"unknown preset {self.preset!r}; choose from {sorted(PRESETS)}")
+        preset = PRESETS[self.preset]
+        if self.resolution is None:
+            self.resolution = tuple(preset["resolution"])  # type: ignore[arg-type]
+        if self.fps is None:
+            self.fps = int(preset["fps"])  # type: ignore[arg-type]
+        if self.resolution[0] % 2 or self.resolution[1] % 2:
+            raise ValueError("resolution must be even in both dimensions for H.264")
+        self.output_dir = Path(self.output_dir)
+        self.scripts_dir = Path(self.scripts_dir)
+        self.cache_dir = Path(self.cache_dir)
+
+    @property
+    def preset_data(self) -> Dict[str, object]:
+        return PRESETS[self.preset]
+
+
+# --------------------------------------------------------------------------- #
+# Markdown helpers
+# --------------------------------------------------------------------------- #
+
+_FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+_SCENE_RE = re.compile(
+    r"^##\s+Scene\s+(?P<index>\d+)\s*(?:[—–-]\s*(?P<duration>[\d.]+)\s*s)?\s*$",
+    re.MULTILINE,
+)
+_FIELD_RE = re.compile(
+    r"^\*\*(?P<key>Visual|Narration|Overlay):\*\*\s*(?P<value>.*)$", re.MULTILINE
+)
+
+
+def _split_frontmatter(text: str) -> Tuple[Dict[str, object], str]:
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return {}, text
+    try:
+        front = yaml.safe_load(match.group(1)) or {}
+    except yaml.YAMLError as exc:
+        LOGGER.warning("malformed frontmatter, ignoring: %s", exc)
+        front = {}
+    if not isinstance(front, dict):
+        front = {}
+    return front, text[match.end() :]
+
+
+def _parse_scenes(body: str) -> List[Scene]:
+    """Parse ``## Scene N`` blocks.
+
+    Tolerant by design: a block missing ``**Narration:**`` yields an empty
+    narration rather than raising, and unparseable input yields ``[]`` so the
+    caller can fall back instead of crashing mid-render.
+    """
+    scenes: List[Scene] = []
+    matches = list(_SCENE_RE.finditer(body))
+    for i, match in enumerate(matches):
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        block = body[start:end]
+        fields = {m.group("key"): m.group("value").strip() for m in _FIELD_RE.finditer(block)}
+        visual = fields.get("Visual", "").strip()
+        narration = fields.get("Narration", "").strip()
+        if not visual and not narration:
+            continue
+        duration = float(match.group("duration") or 0) or MIN_SCENE_SECONDS
+        scenes.append(
+            Scene(
+                index=int(match.group("index")),
+                visual=visual,
+                narration=narration,
+                duration=duration,
+                overlay=fields.get("Overlay", ""),
+            )
+        )
+    return scenes
+
+
+def _slugify(text: str, max_len: int = 32) -> str:
+    """Filename-safe slug, truncated on a word boundary rather than mid-word."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    if len(slug) > max_len:
+        # Drop the trailing partial word, unless that would leave nothing.
+        head = slug[:max_len].rsplit("-", 1)[0]
+        slug = head or slug[:max_len]
+    return slug.strip("-") or "untitled"
+
+
+def _stable_seed(text: str, salt: int = 0) -> int:
+    """Deterministic across processes, unlike ``hash()`` under PYTHONHASHSEED."""
+    digest = hashlib.md5(f"{salt}:{text}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+# --------------------------------------------------------------------------- #
+# Script store
+# --------------------------------------------------------------------------- #
+
+
+class ScriptStore:
+    """Durable, human-editable script archive under ``video_scripts/``."""
+
+    def __init__(self, root: Path = Path("video_scripts")) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def path_for(self, script_id: str) -> Path:
+        return self.root / f"{script_id}.md"
+
+    def save(self, script: VideoScript) -> Path:
+        path = self.path_for(script.id)
+        path.write_text(script.to_markdown(), encoding="utf-8")
+        self.write_index()
+        return path
+
+    def load(self, script_id: str) -> VideoScript:
+        path = Path(script_id) if str(script_id).endswith(".md") else self.path_for(script_id)
+        if not path.exists():
+            raise FileNotFoundError(f"no script at {path}")
+        return VideoScript.from_markdown(path.read_text(encoding="utf-8"))
+
+    def list_scripts(self) -> List[VideoScript]:
+        scripts: List[VideoScript] = []
+        for path in sorted(self.root.glob("*.md")):
+            if path.name == "INDEX.md":
+                continue
+            try:
+                scripts.append(VideoScript.from_markdown(path.read_text(encoding="utf-8")))
+            except Exception as exc:  # noqa: BLE001 - one bad file must not hide the rest
+                LOGGER.warning("skipping unreadable script %s: %s", path.name, exc)
+        scripts.sort(key=lambda s: s.created, reverse=True)
+        return scripts
+
+    def accept(self, script: VideoScript, discard_siblings: bool = True) -> Path:
+        """Mark ``script`` accepted; demote the other candidates from its batch."""
+        script.status = "accepted"
+        batch = script.config.get("batch")
+        if discard_siblings and batch:
+            for other in self.list_scripts():
+                if (
+                    other.id != script.id
+                    and other.config.get("batch") == batch
+                    and other.status == "candidate"
+                ):
+                    other.status = "rejected"
+                    self.path_for(other.id).write_text(other.to_markdown(), encoding="utf-8")
+        return self.save(script)
+
+    def record_render(self, script: VideoScript, record: Dict[str, object]) -> Path:
+        script.renders.append(record)
+        script.status = "rendered"
+        return self.save(script)
+
+    def write_index(self) -> Path:
+        rows = [
+            "# Video script index",
+            "",
+            "Regenerated automatically on every save. One row per script, so both",
+            "you and the model can scan the whole history without opening files.",
+            "",
+            "| id | title | variant | status | scenes | est. | renders |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: |",
+        ]
+        for script in self.list_scripts():
+            rows.append(
+                f"| [`{script.id}`]({script.id}.md) | {script.title} | {script.variant} "
+                f"| {script.status} | {len(script.scenes)} "
+                f"| {script.estimated_duration:.0f}s | {len(script.renders)} |"
+            )
+        path = self.root / "INDEX.md"
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return path
+
+
+# --------------------------------------------------------------------------- #
+# Script generation (deterministic backbone + optional LLM enrichment)
+# --------------------------------------------------------------------------- #
+
+_STOPWORDS = frozenset(
+    """
+    a an the and or but if then than that this these those there here it its of to in on at
+    for with from by as is are was were be been being do does did done have has had having i you
+    he she they we me him her them us my your his their our not no nor so very just also can could
+    would should will shall may might must about into over under after before while when where who
+    whom which what how why all any both each few more most other some such only own same too
+    one every anyway still until again already always never ever yet once now then said says say
+    went get got make made take took come came go going know knew think thought seem seemed
+    """.split()
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'“‘(])|\n{2,}")
+
+
+class StoryScripter:
+    """Turns a prose story into scene lists.
+
+    The deterministic path always runs and always produces well-formed scenes.
+    An optional local LLM only *rewrites the visual prompts*; if it is missing,
+    slow, or emits nonsense, the deterministic text stands.  Keeping the model
+    off the critical path is what makes generation instant and offline-safe.
+    """
+
+    def __init__(self, config: GenerationConfig) -> None:
+        self.config = config
+        self._llm = None
+        self._llm_failed = False
+
+    # -- public ------------------------------------------------------------ #
+
+    def generate_candidates(
+        self, story: str, variants: Optional[Sequence[str]] = None
+    ) -> List[VideoScript]:
+        story = story.strip()
+        if not story:
+            raise ValueError("story is empty")
+        batch = datetime.now().strftime("%Y%m%d-%H%M%S")
+        title = self._derive_title(story)
+        slug = _slugify(title)
+        scripts: List[VideoScript] = []
+        for name in variants or list(VARIANTS):
+            scenes = self._build_scenes(story, name)
+            if self.config.use_llm:
+                scenes = self._enrich(scenes, title, name)
+            suffix = hashlib.md5(f"{batch}{name}".encode()).hexdigest()[:4]
+            scripts.append(
+                VideoScript(
+                    id=f"{datetime.now():%Y-%m-%d}-{slug}-{suffix}",
+                    title=title,
+                    variant=name,
+                    scenes=scenes,
+                    source_story=story,
+                    config={
+                        "preset": self.config.preset,
+                        "seed": self.config.seed,
+                        "batch": batch,
+                        "llm_enriched": bool(self.config.use_llm and not self._llm_failed),
+                    },
+                )
+            )
+        return scripts
+
+    # -- deterministic backbone -------------------------------------------- #
+
+    @staticmethod
+    def split_sentences(story: str) -> List[str]:
+        raw = [s.strip() for s in _SENTENCE_SPLIT_RE.split(story) if s and s.strip()]
+        # Very long sentences are split on clause boundaries so that a single
+        # run-on sentence cannot collapse the whole story into one scene.
+        out: List[str] = []
+        for sentence in raw:
+            if len(sentence.split()) <= 34:
+                out.append(sentence)
+                continue
+            clauses = re.split(
+                r",\s+(?=(?:and|but|then|while|as|until|before|after)\b)", sentence
+            )
+            buf = ""
+            for clause in clauses:
+                buf = f"{buf}, {clause}" if buf else clause
+                if len(buf.split()) >= 14:
+                    out.append(buf.strip(" ,"))
+                    buf = ""
+            if buf.strip(" ,"):
+                out.append(buf.strip(" ,"))
+        return out or [story.strip()]
+
+    @staticmethod
+    def group_into_beats(sentences: Sequence[str], count: int) -> List[str]:
+        """Even-ish contiguous grouping; never drops or reorders sentences."""
+        count = max(1, min(count, len(sentences)))
+        base, extra = divmod(len(sentences), count)
+        beats: List[str] = []
+        cursor = 0
+        for i in range(count):
+            size = base + (1 if i < extra else 0)
+            beats.append(" ".join(sentences[cursor : cursor + size]).strip())
+            cursor += size
+        return [b for b in beats if b]
+
+    def _build_scenes(self, story: str, variant: str) -> List[Scene]:
+        spec = VARIANTS[variant]
+        lo, hi = spec["scenes"]  # type: ignore[misc]
+        sentences = self.split_sentences(story)
+        target = max(lo, min(hi, round(len(sentences) / 1.4) or lo))
+        beats = self.group_into_beats(sentences, target)
+        wpm = float(spec["wpm"])  # type: ignore[arg-type]
+        return [
+            Scene(
+                index=i,
+                visual=self._visual_prompt(beat, str(spec["style"]), story),
+                narration=beat,
+                duration=self.estimate_duration(beat, wpm),
+            )
+            for i, beat in enumerate(beats, start=1)
+        ]
+
+    @staticmethod
+    def estimate_duration(text: str, wpm: float) -> float:
+        words = max(1, len(text.split()))
+        seconds = words / wpm * 60.0 + SCENE_TAIL_PAD
+        return round(max(MIN_SCENE_SECONDS, min(MAX_SCENE_SECONDS, seconds)), 2)
+
+    @staticmethod
+    def keywords(text: str, limit: int = 8) -> List[str]:
+        seen: Dict[str, int] = {}
+        for word in re.findall(r"[A-Za-z][A-Za-z'-]+", text):
+            low = word.lower().strip("'-")
+            if len(low) < 3 or low in _STOPWORDS:
+                continue
+            # Capitalised mid-sentence words are probably proper nouns; weight them.
+            seen[low] = seen.get(low, 0) + (2 if word[0].isupper() else 1)
+        ranked = sorted(seen.items(), key=lambda kv: (-kv[1], text.lower().find(kv[0])))
+        return [w for w, _ in ranked[:limit]]
+
+    def _visual_prompt(self, beat: str, style: str, story: str) -> str:
+        subject = ", ".join(self.keywords(beat, limit=6))
+        context = ", ".join(w for w in self.keywords(story, limit=3) if w not in subject)
+        pieces = [p for p in (subject, context) if p]
+        return f"{', '.join(pieces)}, {style}" if pieces else style
+
+    @staticmethod
+    def _derive_title(story: str) -> str:
+        """Title from the story's own opening words.
+
+        Keyword soup ("One Cartographer Spent Life") makes a poor title, so a
+        long opening sentence is truncated rather than reassembled.
+        """
+        first = StoryScripter.split_sentences(story)[0].strip().rstrip(".!?,;:")
+        words = first.split()
+        if not words:
+            return "Untitled Story"
+        return " ".join(words[:8] if len(words) > 8 else words)
+
+    # -- optional LLM enrichment ------------------------------------------- #
+
+    def _load_llm(self):  # pragma: no cover - requires model download
+        if self._llm is not None or self._llm_failed:
+            return self._llm
+        if not HAS_TRANSFORMERS:
+            self._llm_failed = True
+            return None
+        try:
+            from transformers import pipeline
+
+            self._llm = pipeline(
+                "text-generation",
+                model="Qwen/Qwen2.5-0.5B-Instruct",
+                torch_dtype=torch.float32,
+                device=-1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("LLM enrichment unavailable (%s); using deterministic prompts", exc)
+            self._llm_failed = True
+            self._llm = None
+        return self._llm
+
+    def _enrich(self, scenes: List[Scene], title: str, variant: str) -> List[Scene]:
+        # pragma: no cover - requires model download
+        llm = self._load_llm()
+        if llm is None:
+            return scenes
+        style = str(VARIANTS[variant]["style"])
+        for scene in scenes:
+            prompt = (
+                "Rewrite the following into a single vivid image-generation prompt. "
+                "Describe only what is visible: subject, setting, lighting, framing. "
+                "No narration, no quotes, under 40 words.\n\n"
+                f"Story title: {title}\nScene text: {scene.narration}\nAnswer:"
+            )
+            try:
+                out = llm(
+                    [{"role": "user", "content": prompt}],
+                    max_new_tokens=64,
+                    do_sample=False,
+                    return_full_text=False,
+                )
+                text = out[0]["generated_text"].strip().strip('"')
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("LLM enrichment failed on scene %s: %s", scene.index, exc)
+                continue
+            # Reject degenerate output rather than poisoning the prompt.
+            if 12 <= len(text) <= 400 and "\n" not in text.strip():
+                scene.visual = f"{text}, {style}"
+        return scenes
+
+
+# --------------------------------------------------------------------------- #
+# Audio helpers
+# --------------------------------------------------------------------------- #
+
+
+def _system_tts_command() -> Optional[str]:
+    """Locate an offline OS speech synthesiser, if one exists."""
+    if sys.platform == "darwin" and shutil.which("say"):
+        return "say"
+    for candidate in ("espeak-ng", "espeak"):
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
+def _write_wav(path: Path, samples: np.ndarray, sample_rate: int) -> None:
+    """Write mono float32 [-1, 1] audio, preferring soundfile, else stdlib."""
+    samples = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if HAS_SOUNDFILE:
+        sf.write(str(path), samples, sample_rate)
+        return
+    import wave
+
+    pcm = (samples * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(pcm.tobytes())
+
+
+# --------------------------------------------------------------------------- #
+# Engine
+# --------------------------------------------------------------------------- #
+
+ProgressCallback = Callable[[float, str], None]
+
 
 class FreeTextToVideoGenerator:
+    """The pipeline: story -> candidate scripts -> accepted script -> MP4."""
+
     def __init__(
         self,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        model_config: ModelConfig = ModelConfig(),
-        generation_config: GenerationConfig = GenerationConfig()
-    ):
-        self.device = device
-        self.model_config = model_config
-        self.generation_config = generation_config
-        self.temp_dir = tempfile.mkdtemp()
-        
-        # Create a requests session with retries
-        self.requests_session = create_session_with_retries()
-        
-        # Thread safety locks
-        self._model_lock = Lock()
-        self._cache_lock = Lock()
-        
-        logger.info(f"Using device: {self.device}")
-        logger.info(f"Temporary directory: {self.temp_dir}")
-        
-        # Initialize model containers (lazy loading)
-        self._text_generator = None
-        self._tts_model = None
-        self._tts_tokenizer = None
-        self._image_generator = None
-        self._img2img_generator = None
-        
-        # Font for text overlay
-        self.font = self._load_font()
-        
-        # Image cache with LRU eviction
-        self._image_cache = {}
-        self._image_cache_size = generation_config.image_cache_size
-        
-        # Character reference for consistency
-        self._character_reference = None
-        
-        # Validate configuration
-        self._validate_config()
-        
-        # Register cleanup on exit
-        atexit.register(self.cleanup)
-    
-    def __del__(self):
-        """Clean up resources when instance is garbage collected"""
-        self.cleanup()
-    
-    def _validate_config(self):
-        """Validate configuration parameters"""
-        if self.generation_config.min_scene_duration >= self.generation_config.max_scene_duration:
-            raise ValueError("min_scene_duration must be less than max_scene_duration")
-        
-        if self.generation_config.music_volume < 0 or self.generation_config.music_volume > 1:
-            raise ValueError("music_volume must be between 0.0 and 1.0")
-        
-        if self.generation_config.max_workers < 1:
-            raise ValueError("max_workers must be at least 1")
-        
-        if self.generation_config.max_video_duration > 3600:
-            raise ValueError("max_video_duration cannot exceed 3600 seconds (1 hour)")
-        
-        if self.generation_config.tts_voice not in ["male", "female", "neutral"]:
-            raise ValueError("tts_voice must be one of: 'male', 'female', 'neutral'")
-        
-        if self.generation_config.tts_speed <= 0 or self.generation_config.tts_speed > 3.0:
-            raise ValueError("tts_speed must be between 0.0 and 3.0")
-    
-    def unload_models(self):
-        """Unload models to free memory with thread safety"""
-        with self._model_lock:
-            models = [
-                '_text_generator', '_tts_model', '_tts_tokenizer',
-                '_image_generator', '_img2img_generator'
-            ]
-            
-            for model in models:
-                if hasattr(self, model):
-                    delattr(self, model)
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            logger.info("Models unloaded and memory freed")
-    
-    @property
-    def text_generator(self):
-        """Lazy load text generation model with thread safety"""
-        with self._model_lock:
-            if self._text_generator is None:
-                self._load_text_model()
-            return self._text_generator
-    
-    @property
-    def tts_model(self):
-        """Lazy load TTS model with thread safety"""
-        with self._model_lock:
-            if self._tts_model is None:
-                self._load_tts_model()
-            return self._tts_model
-    
-    @property
-    def tts_tokenizer(self):
-        """Lazy load TTS tokenizer with thread safety"""
-        with self._model_lock:
-            if self._tts_tokenizer is None:
-                self._load_tts_model()
-            return self._tts_tokenizer
-    
-    @property
-    def image_generator(self):
-        """Lazy load image generation model with thread safety"""
-        with self._model_lock:
-            if self._image_generator is None:
-                self._load_image_model()
-            return self._image_generator
-    
-    @property
-    def img2img_generator(self):
-        """Lazy load img2img model with thread safety"""
-        with self._model_lock:
-            if self._img2img_generator is None:
-                self._load_img2img_model()
-            return self._img2img_generator
-    
-    def _load_text_model(self):
-        """Load text generation model based on configuration"""
-        model_map = {
-            ModelType.SMALL: "google/flan-t5-small",
-            ModelType.MEDIUM: "google/flan-t5-base",
-            ModelType.LARGE: "google/flan-t5-large",
-            ModelType.XL: "google/flan-t5-xl"
-        }
-        
-        model_name = model_map[self.model_config.text_model]
-        logger.info(f"Loading text generation model: {model_name}")
-        
-        try:
-            # Load model directly without low_cpu_mem_usage to avoid meta tensor issues
-            self._text_generator = pipeline(
-                'text2text-generation',
-                model=model_name,
-                device=self.device if self.device != "meta" else -1,
-                torch_dtype=torch.float32
-            )
-        except Exception as e:
-            logger.error(f"Failed to load text model: {str(e)}")
-            # Fallback to CPU if GPU loading fails
-            try:
-                self._text_generator = pipeline(
-                    'text2text-generation',
-                    model=model_name,
-                    device=-1,  # Force CPU
-                    torch_dtype=torch.float32
-                )
-            except Exception as e2:
-                logger.error(f"Failed to load text model on CPU: {str(e2)}")
-                self._text_generator = None
-    
-    def _load_tts_model(self):
-        """Load TTS model based on configuration with proper meta tensor handling"""
-        model_map = {
-            ModelType.SMALL: "facebook/mms-tts-eng",
-            ModelType.MEDIUM: "facebook/mms-tts-eng",
-            ModelType.LARGE: "facebook/vits-tts",
-            ModelType.XL: "facebook/mms-tts-eng"  # No XL version available, using medium
-        }
-        
-        model_name = model_map[self.model_config.tts_model]
-        logger.info(f"Loading TTS model: {model_name}")
-        
-        try:
-            # First load tokenizer
-            self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name)
-            
-            # Then load model with proper device handling
-            if self.device == "cuda" and torch.cuda.is_available():
-                # For CUDA, load model directly
-                self._tts_model = VitsModel.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float32
-                ).to(self.device)
-            else:
-                # For CPU, load with torch_dtype=float32
-                self._tts_model = VitsModel.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float32
-                ).to("cpu")
-                
-        except Exception as e:
-            logger.error(f"Failed to load TTS model: {str(e)}")
-            # Fallback to a simpler TTS approach
-            self._tts_model = None
-            self._tts_tokenizer = None
-    
-    def _load_image_model(self):
-        """Load image generation model based on configuration with proper meta tensor handling"""
-        model_map = {
-            ModelType.SMALL: "CompVis/stable-diffusion-v1-4",
-            ModelType.MEDIUM: "runwayml/stable-diffusion-v1-5",
-            ModelType.LARGE: "stabilityai/stable-diffusion-2-1",
-            ModelType.XL: "stabilityai/stable-diffusion-xl-base-1.0"
-        }
-        
-        model_name = model_map[self.model_config.image_model]
-        logger.info(f"Loading image generation model: {model_name}")
-        
-        try:
-            # Use Euler scheduler for better quality
-            scheduler = EulerDiscreteScheduler.from_pretrained(model_name, subfolder="scheduler")
-            
-            # Set appropriate torch_dtype based on device
-            torch_dtype = torch.float16 if self.device == "cuda" and torch.cuda.is_available() else torch.float32
-            
-            # Load model with appropriate settings
-            self._image_generator = StableDiffusionPipeline.from_pretrained(
-                model_name,
-                scheduler=scheduler,
-                torch_dtype=torch_dtype,
-                safety_checker=None if not self.generation_config.enable_safety_checker else None,
-                variant="fp16" if torch_dtype == torch.float16 else None,
-                device_map="auto" if self.device == "cuda" else None
-            )
-            
-            # Move to device after loading
-            if self.device == "cuda" and torch.cuda.is_available():
-                self._image_generator = self._image_generator.to(self.device)
-            
-            # Enable memory optimizations if available
-            try:
-                if hasattr(self._image_generator, "enable_xformers_memory_efficient_attention"):
-                    self._image_generator.enable_xformers_memory_efficient_attention()
-            except:
-                pass
-            
-            try:
-                if hasattr(self._image_generator, "enable_model_cpu_offload"):
-                    self._image_generator.enable_model_cpu_offload()
-            except:
-                pass
-                    
-        except Exception as e:
-            logger.error(f"Failed to load image model: {str(e)}")
-            # Create a dummy generator as fallback
-            self._image_generator = None
-    
-    def _load_img2img_model(self):
-        """Load img2img model for character consistency with proper meta tensor handling"""
-        logger.info("Loading img2img model for character consistency")
-        
-        try:
-            # Set appropriate torch_dtype based on device
-            torch_dtype = torch.float16 if self.device == "cuda" and torch.cuda.is_available() else torch.float32
-            
-            self._img2img_generator = StableDiffusionImg2ImgPipeline.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                torch_dtype=torch_dtype,
-                variant="fp16" if torch_dtype == torch.float16 else None,
-                device_map="auto" if self.device == "cuda" else None
-            )
-            
-            # Move to device after loading
-            if self.device == "cuda" and torch.cuda.is_available():
-                self._img2img_generator = self._img2img_generator.to(self.device)
-            
-            # Enable memory optimizations if available
-            try:
-                if hasattr(self._img2img_generator, "enable_xformers_memory_efficient_attention"):
-                    self._img2img_generator.enable_xformers_memory_efficient_attention()
-            except:
-                pass
-            
-            try:
-                if hasattr(self._img2img_generator, "enable_model_cpu_offload"):
-                    self._img2img_generator.enable_model_cpu_offload()
-            except:
-                pass
-                    
-        except Exception as e:
-            logger.error(f"Failed to load img2img model: {str(e)}")
-            # Create a dummy generator as fallback
-            self._img2img_generator = None
-    
-    def _load_font(self):
-        """Try to load a nice font, fallback to default"""
-        font_paths = [
-            "arial.ttf",
-            "Arial.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/Library/Fonts/Arial.ttf"
-        ]
-        
-        for path in font_paths:
-            try:
-                return ImageFont.truetype(path, 40)
-            except:
-                continue
-        return ImageFont.load_default()
-    
-    def switch_model(self, model_type: str, model_size: ModelType):
-        """Safely switch a model type with proper cleanup"""
-        model_type = model_type.lower()
-        valid_types = ['text', 'tts', 'image']
-        
-        if model_type not in valid_types:
-            raise ValueError(f"Invalid model type. Must be one of {valid_types}")
-        
-        # Unload current model
-        with self._model_lock:
-            if model_type == 'text' and self._text_generator is not None:
-                del self._text_generator
-                self._text_generator = None
-            elif model_type == 'tts':
-                if self._tts_model is not None:
-                    del self._tts_model
-                    self._tts_model = None
-                if self._tts_tokenizer is not None:
-                    del self._tts_tokenizer
-                    self._tts_tokenizer = None
-            elif model_type == 'image':
-                if self._image_generator is not None:
-                    del self._image_generator
-                    self._image_generator = None
-                if self._img2img_generator is not None:
-                    del self._img2img_generator
-                    self._img2img_generator = None
-            
-            # Update config
-            setattr(self.model_config, f"{model_type}_model", model_size)
-            
-            # Force garbage collection
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            logger.info(f"Switched {model_type} model to {model_size.value}")
-    
-    def generate_script(
-        self,
-        prompt: str,
-        max_length: int = 500,
-        num_scenes: Optional[int] = None
-    ) -> List[Dict[str, str]]:
-        """Generate a video script from text prompt with controlled scene count"""
-        if num_scenes is None:
-            # Calculate target number of scenes based on desired video length
-            avg_scene_duration = (
-                self.generation_config.min_scene_duration +
-                self.generation_config.max_scene_duration
-            ) / 2
-            num_scenes = max(3, min(8, int(self.generation_config.video_length / avg_scene_duration)))
-        
-        # Create a more detailed prompt for script generation
-        detailed_prompt = (
-            f"Create a {num_scenes}-scene video script about: {prompt}.\n"
-            "Each scene should have:\n"
-            "1. A detailed visual description (what to show)\n"
-            "2. Concise narration text (what to say)\n"
-            "Format exactly as:\n"
-            "Scene 1: [visual description] | [narration text]\n"
-            "Scene 2: [visual description] | [narration text]\n"
-            "..."
-        )
-        
-        try:
-            result = self.text_generator(
-                detailed_prompt,
-                max_length=max_length,
-                num_return_sequences=1,
-                temperature=self.generation_config.text_model_temp,
-                do_sample=True
-            )
-            
-            script = result[0]['generated_text']
-            return self._parse_script(script)
-        except Exception as e:
-            logger.error(f"Script generation failed: {str(e)}")
-            # Fallback to simple scenes
-            return [{
-                "visual": prompt,
-                "narration": prompt[:100] + "..." if len(prompt) > 100 else prompt
-            }]
-    
-    def _parse_script(self, script_text: str) -> List[Dict[str, str]]:
-        """Parse generated script into structured scenes with improved error handling"""
-        scenes = []
-        
-        # Try pipe separator format first
-        if "|" in script_text:
-            scene_lines = [line.strip() for line in script_text.split("\n") if line.strip()]
-            for line in scene_lines:
-                if ":" in line and "|" in line:
-                    scene_num, rest = line.split(":", 1)
-                    visual, narration = rest.split("|", 1)
-                    scenes.append({
-                        "visual": visual.strip(),
-                        "narration": narration.strip()
-                    })
-            if scenes:
-                return scenes
-        
-        # Fallback to regex parsing
-        scene_pattern = r"Scene \d+:\s*(.*?)\s*(.*?)(?=(?:Scene \d+:|$))"
-        matches = re.findall(scene_pattern, script_text, re.DOTALL)
-        
-        if matches:
-            for visual, narration in matches:
-                scenes.append({
-                    "visual": visual.strip(),
-                    "narration": narration.strip()
-                })
-        else:
-            # Final fallback: simple split by sentences
-            sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s', script_text)
-            for i, sentence in enumerate(sentences[:8]):  # Limit to 8 scenes max
-                scenes.append({
-                    "visual": f"Scene {i+1}: {sentence.strip()}",
-                    "narration": sentence.strip()
-                })
-        
-        return scenes
-    
-    def _get_cache_path(self, cache_key: str) -> str:
-        """Get the file path for a cache key"""
-        return os.path.join(self.temp_dir, f"cache_{cache_key}.png")
-    
-    def _save_to_cache(self, cache_key: str, image: Image.Image):
-        """Save an image to disk cache with LRU eviction"""
-        if not self.generation_config.use_disk_cache:
-            return
-            
-        with self._cache_lock:
-            cache_path = self._get_cache_path(cache_key)
-            image.save(cache_path)
-            
-            # Manage cache size
-            cache_files = sorted(
-                [f for f in os.listdir(self.temp_dir) if f.startswith("cache_")],
-                key=lambda f: os.path.getmtime(os.path.join(self.temp_dir, f))
-            )
-            
-            while len(cache_files) > self._image_cache_size:
-                os.remove(os.path.join(self.temp_dir, cache_files.pop(0)))
-    
-    def _load_from_cache(self, cache_key: str) -> Optional[Image.Image]:
-        """Load an image from disk cache"""
-        if not self.generation_config.use_disk_cache:
-            return None
-            
-        with self._cache_lock:
-            cache_path = self._get_cache_path(cache_key)
-            if os.path.exists(cache_path):
-                # Update access time
-                os.utime(cache_path, None)
-                return Image.open(cache_path)
-            return None
-    
-    @functools.lru_cache(maxsize=32)
-    def generate_speech(self, text: str, output_path: str) -> str:
-        """Enhanced TTS with voice control and speed adjustment"""
-        # Check if TTS model is available
-        if self.tts_model is None or self.tts_tokenizer is None:
-            logger.warning("TTS model not available, creating silent audio")
-            return self._generate_silent_audio(output_path)
-        
-        try:
-            # Add voice control to prompt
-            voice_prompt = f"[{self.generation_config.tts_voice} voice]{text}"
-            
-            inputs = self.tts_tokenizer(voice_prompt, return_tensors="pt")
-            
-            # Move inputs to the same device as the model
-            if hasattr(self.tts_model, "device"):
-                inputs = {k: v.to(self.tts_model.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                output = self.tts_model(**inputs).waveform
-            
-            # Convert to numpy and save
-            audio = output.cpu().numpy().squeeze()
-            
-            # Apply speed adjustment
-            if self.generation_config.tts_speed != 1.0:
-                audio = self._adjust_speed(audio, self.generation_config.tts_speed)
-            
-            sf.write(output_path, audio, samplerate=self.generation_config.tts_sampling_rate)
-            return output_path
-        except Exception as e:
-            logger.error(f"TTS generation failed: {str(e)}")
-            return self._generate_silent_audio(output_path)
-    
-    def _generate_silent_audio(self, output_path: str) -> str:
-        """Generate silent audio as fallback"""
-        duration = self.generation_config.min_scene_duration
-        silent_audio = np.zeros(int(duration * self.generation_config.tts_sampling_rate))
-        sf.write(output_path, silent_audio, samplerate=self.generation_config.tts_sampling_rate)
-        return output_path
-    
-    def _adjust_speed(self, audio: np.ndarray, speed: float) -> np.ndarray:
-        """Adjust audio speed using resampling"""
-        if speed <= 0:
-            return audio
-            
-        new_length = int(len(audio) / speed)
-        if new_length <= 0:
-            return audio
-            
-        return resample(audio, new_length)
-    
-    def generate_image(
-        self,
-        prompt: str,
-        seed: Optional[int] = None,
-        negative_prompt: Optional[str] = None,
-        use_cache: bool = True
-    ) -> Image.Image:
-        """Generate an image from text prompt with enhanced controls and caching"""
-        # Check if image generator is available
-        if self.image_generator is None:
-            logger.warning("Image generator not available, creating black image")
-            return Image.new(
-                'RGB',
-                (self.generation_config.image_width, self.generation_config.image_height),
-                color='black'
-            )
-        
-        # Create cache key
-        cache_key = hashlib.md5(f"{prompt}_{seed}_{negative_prompt}".encode()).hexdigest()
-        
-        # Check disk cache first
-        if use_cache and self.generation_config.use_disk_cache:
-            cached_image = self._load_from_cache(cache_key)
-            if cached_image is not None:
-                logger.debug(f"Using disk-cached image for prompt: {prompt[:50]}...")
-                return cached_image
-        
-        # Check memory cache
-        if use_cache and cache_key in self._image_cache:
-            logger.debug(f"Using memory-cached image for prompt: {prompt[:50]}...")
-            return self._image_cache[cache_key]
-        
-        if seed is None and self.generation_config.seed is not None:
-            seed = self.generation_config.seed + hash(prompt) % 1000
-        
-        if seed:
-            torch.manual_seed(seed)
-        
-        # Add style to the prompt for better results
-        styled_prompt = (
-            f"{prompt}, high quality, cinematic lighting, detailed, 8k, "
-            "professional photography, ultra realistic"
-        )
-        
-        # Default negative prompt
-        if negative_prompt is None:
-            negative_prompt = (
-                "blurry, low quality, cartoon, anime, deformed, distorted, "
-                "extra limbs, disfigured"
-            )
-        
-        try:
-            image = self.image_generator(
-                styled_prompt,
-                negative_prompt=negative_prompt,
-                height=self.generation_config.image_height,
-                width=self.generation_config.image_width,
-                num_inference_steps=self.generation_config.image_steps,
-                guidance_scale=self.generation_config.image_cfg_scale
-            ).images[0]
-            
-            # Cache the image
-            if use_cache:
-                # Save to disk cache
-                if self.generation_config.use_disk_cache:
-                    self._save_to_cache(cache_key, image)
-                
-                # Manage memory cache size
-                if len(self._image_cache) >= self._image_cache_size:
-                    # Remove oldest entry
-                    oldest_key = next(iter(self._image_cache))
-                    del self._image_cache[oldest_key]
-                
-                self._image_cache[cache_key] = image
-            
-            return image
-        except Exception as e:
-            logger.error(f"Image generation failed: {str(e)}")
-            # Return black image as fallback
-            return Image.new(
-                'RGB',
-                (self.generation_config.image_width, self.generation_config.image_height),
-                color='black'
-            )
-    
-    def generate_consistent_character(self, character_description: str) -> Image.Image:
-        """Generate a consistent character reference image"""
-        if self._character_reference is None:
-            # Generate base character image
-            self._character_reference = self.generate_image(
-                f"Full body portrait of {character_description}, detailed face, neutral expression",
-                seed=42  # Fixed seed for consistency
-            )
-        return self._character_reference
-    
-    def generate_character_scene(
-        self,
-        scene_description: str,
-        character_reference: Image.Image,
-        seed: Optional[int] = None
-    ) -> Image.Image:
-        """Generate a scene with consistent character"""
-        if self.img2img_generator is None:
-            logger.warning("Img2Img model not available, returning character reference")
-            return character_reference
-            
-        if seed is None and self.generation_config.seed is not None:
-            seed = self.generation_config.seed + hash(scene_description) % 1000
-        
-        if seed:
-            torch.manual_seed(seed)
-        
-        try:
-            image = self.img2img_generator(
-                prompt=scene_description,
-                image=character_reference,
-                strength=0.75,  # Balance between new content and character
-                guidance_scale=7.5,
-                num_inference_steps=20
-            ).images[0]
-            return image
-        except Exception as e:
-            logger.error(f"Character scene generation failed: {str(e)}")
-            return character_reference
-    
-    def generate_keyframes(
-        self,
-        prompt: str,
-        num_frames: int = 5,
-        seed: Optional[int] = None
-    ) -> List[Image.Image]:
-        """Generate keyframes with prompt variations and parallel processing"""
-        if num_frames < 2:
-            raise ValueError("num_frames must be at least 2")
-        
-        # Create varied prompts for each frame
-        prompts = [
-            f"{prompt}, frame {i+1}/{num_frames}, " + 
-            f"camera angle: {['wide','medium','close-up'][i%3]}, " +
-            f"time: {['morning','afternoon','evening','night'][i%4]}"
-            for i in range(num_frames)
-        ]
-        
-        # Generate frames in parallel
-        with ThreadPoolExecutor(
-            max_workers=min(num_frames, self.generation_config.max_workers)
-        ) as executor:
-            futures = {
-                executor.submit(
-                    self.generate_image,
-                    p,
-                    seed=seed + i if seed else None,
-                    use_cache=False
-                ): i for i, p in enumerate(prompts)
-            }
-            
-            # Collect results in order
-            frames = [None] * num_frames
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    frames[idx] = future.result()
-                except Exception as e:
-                    logger.error(f"Keyframe generation failed for frame {idx}: {str(e)}")
-                    # Fallback to first frame if generation fails
-                    frames[idx] = frames[0] if idx > 0 and frames[0] else Image.new(
-                        'RGB',
-                        (self.generation_config.image_width, self.generation_config.image_height),
-                        color='black'
-                    )
-            
-            return frames
-    
-    def interpolate_frames(
-        self,
-        keyframes: List[Image.Image],
-        duration: float,
-        fps: int = 24
-    ) -> List[Image.Image]:
-        """Interpolate between keyframes to create smooth animation"""
-        if len(keyframes) < 2:
-            return keyframes
-        
-        # Calculate number of frames needed
-        total_frames = int(duration * fps)
-        frames_per_segment = total_frames // (len(keyframes) - 1)
-        
-        interpolated_frames = []
-        
-        for i in range(len(keyframes) - 1):
-            start_frame = np.array(keyframes[i])
-            end_frame = np.array(keyframes[i + 1])
-            
-            # Create interpolation function for each color channel
-            interp_functions = []
-            for c in range(3):  # RGB channels
-                interp_func = interp1d(
-                    [0, frames_per_segment],
-                    [start_frame[:, :, c].flatten(), end_frame[:, :, c].flatten()],
-                    kind='linear',
-                    axis=0
-                )
-                interp_functions.append(interp_func)
-            
-            # Generate interpolated frames
-            for j in range(frames_per_segment):
-                interpolated = np.zeros_like(start_frame)
-                for c in range(3):
-                    channel_data = interp_functions[c](j).reshape(start_frame[:, :, c].shape)
-                    interpolated[:, :, c] = channel_data
-                
-                interpolated_frames.append(Image.fromarray(interpolated.astype('uint8')))
-        
-        return interpolated_frames
-    
-    def generate_background_music(self, mood: str, duration: float) -> np.ndarray:
-        """Generate background music (simulated with sine waves)"""
-        # This is a simplified version - in a real implementation, you would use a music generation model
-        sample_rate = 22050
-        t = np.linspace(0, duration, int(sample_rate * duration), False)
-        
-        # Generate different tones based on mood
-        if "happy" in mood.lower():
-            frequencies = [440, 554.37, 659.25]  # A major chord
-        elif "sad" in mood.lower():
-            frequencies = [220, 246.94, 293.66]  # A minor chord
-        elif "exciting" in mood.lower():
-            frequencies = [523.25, 659.25, 783.99]  # C major chord
-        else:
-            frequencies = [440, 554.37, 659.25]  # Default to A major
-        
-        # Generate the music
-        music = np.zeros_like(t)
-        for freq in frequencies:
-            music += np.sin(2 * np.pi * freq * t) * 0.3
-        
-        # Add some variation
-        envelope = np.exp(-t / (duration / 3))  # Fade out
-        music = music * envelope
-        
-        # Normalize
-        if np.max(np.abs(music)) > 0:
-            music = music / np.max(np.abs(music))
-        
-        return music
-    
-    def create_text_overlay(self, image: Image.Image, text: str) -> Image.Image:
-        """Add text overlay to image with improved layout"""
-        draw = ImageDraw.Draw(image)
-        
-        # Split long text into multiple lines
-        max_line_length = 40
-        words = text.split()
-        lines = []
-        current_line = []
-        
-        for word in words:
-            if len(' '.join(current_line + [word])) <= max_line_length:
-                current_line.append(word)
-            else:
-                lines.append(' '.join(current_line))
-                current_line = [word]
-        if current_line:
-            lines.append(' '.join(current_line))
-        
-        text = '\n'.join(lines[:3])  # Max 3 lines
-        
-        # Calculate text position (centered at bottom)
-        # Use textbbox instead of deprecated getsize
-        try:
-            # For newer Pillow versions
-            bbox = draw.textbbox((0, 0), text, font=self.font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-        except AttributeError:
-            # Fallback for older Pillow versions
-            try:
-                text_width, text_height = draw.textsize(text, font=self.font)
-            except AttributeError:
-                # Ultimate fallback
-                text_width, text_height = len(text) * 20, 40
-        
-        position = (20, image.height - text_height - 20)
-        
-        # Add semi-transparent background for better readability
-        bg_padding = 10
-        bg_coords = (
-            position[0] - bg_padding,
-            position[1] - bg_padding,
-            image.width - 20 + bg_padding,
-            image.height - 20 + bg_padding
-        )
-        bg = Image.new('RGBA', image.size, (0, 0, 0, 0))
-        bg_draw = ImageDraw.Draw(bg)
-        bg_draw.rectangle(bg_coords, fill=(0, 0, 0, 128))
-        image = Image.alpha_composite(image.convert('RGBA'), bg).convert('RGB')
-        
-        # Recreate draw object after alpha composition
-        draw = ImageDraw.Draw(image)
-        
-        # Add text with shadow
-        shadow_offset = 2
-        for i, line in enumerate(text.split('\n')):
-            y = position[1] + (i * text_height // len(text.split('\n')))
-            draw.text((position[0]+shadow_offset, y+shadow_offset), line, font=self.font, fill="black")
-            draw.text((position[0], y), line, font=self.font, fill="white")
-        
-        return image
-    
-    def _calculate_scene_duration(self, narration: str) -> float:
-        """Calculate appropriate duration for a scene based on its content"""
-        # Base duration on word count (average 3 words per second)
-        word_count = len(narration.split())
-        base_duration = word_count / 3
-        
-        # Constrain within min/max bounds
-        return min(
-            max(
-                base_duration,
-                self.generation_config.min_scene_duration
-            ),
-            self.generation_config.max_scene_duration
-        )
-    
-    def _normalize_audio(self, audio_clip: AudioFileClip) -> AudioFileClip:
-        """Normalize audio levels to target dB level"""
-        try:
-            # Calculate current loudness (RMS)
-            try:
-                max_volume = audio_clip.max_volume()
-            except:
-                # Fallback for when max_volume fails
-                max_volume = 0.01
-                
-            if max_volume < 0.001:  # Silent audio
-                return audio_clip
-            
-            # Calculate desired gain (simplified loudness normalization)
-            target_linear = 10 ** (self.generation_config.target_audio_db / 20)
-            current_linear = max_volume
-            gain = target_linear / current_linear
-            
-            # Apply gain with safety limits
-            safe_gain = min(max(gain, 0.1), 10.0)  # Limit between 0.1x and 10x
-            return audio_clip.fx(volumex, safe_gain)
-        
-        except Exception as e:
-            logger.error(f"Audio normalization failed: {str(e)}")
-            return audio_clip
-    
-    def _get_video_preset(self, num_scenes: int) -> str:
-        """Determine optimal encoding preset based on complexity"""
-        total_pixels = self.generation_config.image_width * self.generation_config.image_height
-        
-        if num_scenes > 8 or total_pixels > 2000000:  # >2MP
-            return 'fast'
-        elif num_scenes > 5 or total_pixels > 1000000:  # >1MP
-            return 'medium'
-        else:
-            return 'slow'
-    
-    def _safety_check(self, video_path: str) -> bool:
-        """Fixed version with proper array comparison"""
-        try:
-            if not os.path.exists(video_path):
-                return False
-                
-            file_size = os.path.getsize(video_path)
-            if file_size < 1024:
-                return False
-                
-            with VideoFileClip(video_path) as clip:
-                if clip.duration < 0.1:
-                    return False
-                    
-                if clip.size[0] < 16 or clip.size[1] < 16:
-                    return False
-                    
-                # Fixed array comparison
-                first_frame = clip.get_frame(0)
-                if np.all(first_frame < 10):  # Now properly compares all elements
-                    return False
-                    
-            return True
-            
-        except Exception as e:
-            logger.error(f"Video safety check failed: {str(e)}")
-            return False
-    
-    def process_single_scene(
-        self,
-        scene: Dict[str, str],
-        scene_index: int,
-        character_reference: Optional[Image.Image] = None,
-        callback: Optional[Callable[[int, str], None]] = None
-    ) -> Tuple[List[Image.Image], AudioFileClip]:
-        """Process a single scene with enhanced error handling"""
-        try:
-            if callback:
-                callback(scene_index * 10, f"Processing scene {scene_index + 1}")
-            
-            # Generate audio for narration
-            audio_path = os.path.join(self.temp_dir, f"audio_{scene_index}.wav")
-            self.generate_speech(scene["narration"], audio_path)
-            
-            # Load and normalize audio
-            audio_clip = AudioFileClip(audio_path)
-            audio_clip = self._normalize_audio(audio_clip)
-            
-            # Calculate target duration with constraints
-            target_duration = min(
-                max(
-                    len(scene["narration"].split()) / 3,  # 3 words per second
-                    self.generation_config.min_scene_duration
-                ),
-                self.generation_config.max_scene_duration
-            )
-            
-            # Adjust audio to match target duration
-            if audio_clip.duration > target_duration + 0.5:
-                speed_factor = audio_clip.duration / target_duration
-                audio_clip = audio_clip.fx(speedx, min(speed_factor, 2.0))  # Max 2x speed
-            elif audio_clip.duration < target_duration - 0.5:
-                speed_factor = audio_clip.duration / target_duration
-                audio_clip = audio_clip.fx(speedx, max(speed_factor, 0.5))  # Min 0.5x speed
-            
-            # Generate visual content
-            frames = []
-            if (self.generation_config.enable_animation and 
-                target_duration > self.generation_config.min_scene_duration * 1.5):
-                
-                # Create animated scene
-                keyframes = self.generate_keyframes(
-                    scene["visual"],
-                    num_frames=5,
-                    seed=42 + scene_index + (self.generation_config.seed or 0)
-                )
-                frames = self.interpolate_frames(
-                    keyframes,
-                    target_duration
-                )
-                
-            elif (self.generation_config.enable_character_consistency and 
-                  character_reference and "character" in scene["visual"].lower()):
-                
-                # Generate consistent character scene
-                image = self.generate_character_scene(
-                    scene["visual"],
-                    character_reference,
-                    seed=42 + scene_index + (self.generation_config.seed or 0)
-                )
-                frames = [image] * int(target_duration * 24)  # 24 FPS
-                
-            else:
-                # Generate static image
-                image = self.generate_image(
-                    scene["visual"],
-                    seed=42 + scene_index + (self.generation_config.seed or 0)
-                )
-                frames = [image] * int(target_duration * 24)  # 24 FPS
-            
-            # Add text overlay to first frame
-            if frames:
-                frames[0] = self.create_text_overlay(
-                    frames[0],
-                    scene["narration"][:100] + ("..." if len(scene["narration"]) > 100 else "")
-                )
-            
-            return frames, audio_clip
-            
-        except Exception as e:
-            logger.error(f"Scene {scene_index} processing failed: {str(e)}")
-            # Return fallback content
-            fallback_image = Image.new(
-                'RGB',
-                (self.generation_config.image_width, self.generation_config.image_height),
-                color='black'
-            )
-            fallback_frames = [fallback_image] * int(self.generation_config.min_scene_duration * 24)
-            
-            # Create silent audio
-            silent_audio = AudioClip(
-                lambda t: 0,
-                duration=self.generation_config.min_scene_duration,
-                fps=self.generation_config.tts_sampling_rate
-            )
-            
-            return fallback_frames, silent_audio
-    
-    def _pipeline_processing(self, scenes: List[Dict[str, str]]) -> List[Tuple[List[Image.Image], AudioFileClip]]:
-        """Process scenes using a producer-consumer pipeline for optimal performance"""
-        scene_queue = Queue()
-        result_queue = Queue()
-        
-        # Track progress
-        processed_count = 0
-        total_count = len(scenes)
-        progress_lock = Lock()
-        
-        # Producer thread
-        def producer():
-            for i, scene in enumerate(scenes):
-                scene_queue.put((i, scene))
-            # Add sentinels for each worker
-            for _ in range(self.generation_config.max_workers):
-                scene_queue.put(None)
-        
-        # Worker threads
-        def worker():
-            nonlocal processed_count
-            while True:
-                item = scene_queue.get()
-                if item is None:
-                    break
-                
-                scene_index, scene = item
-                try:
-                    result = self.process_single_scene(
-                        scene, 
-                        scene_index,
-                        self._character_reference if self.generation_config.enable_character_consistency else None
-                    )
-                    result_queue.put((scene_index, result))
-                    
-                    # Update progress
-                    with progress_lock:
-                        processed_count += 1
-                        logger.info(f"Processed scene {scene_index+1}/{total_count}")
-                        
-                except Exception as e:
-                    logger.error(f"Scene {scene_index} processing failed: {str(e)}")
-                    # Add empty result as fallback
-                    result_queue.put((scene_index, ([], AudioClip(lambda t: 0, duration=1, fps=44100))))
-        
-        # Start producer thread
-        producer_thread = Thread(target=producer)
-        producer_thread.start()
-        
-        # Start worker threads
-        workers = [Thread(target=worker) for _ in range(self.generation_config.max_workers)]
-        for w in workers:
-            w.start()
-        
-        # Wait for producer to finish
-        producer_thread.join()
-        
-        # Wait for workers to finish
-        for w in workers:
-            w.join()
-        
-        # Collect results in order
-        results = [None] * total_count
-        while not result_queue.empty():
-            scene_index, result = result_queue.get()
-            results[scene_index] = result
-        
-        return results
-    
-    def create_video(
-        self,
-        scenes: List[Dict[str, str]],
-        output_filename: str = "output.mp4",
-        add_transitions: bool = True,
-        callback: Optional[Callable[[int, str], None]] = None
-    ) -> str:
-        """Create video with enhanced quality controls"""
-        try:
-            # Validate input duration
-            estimated_duration = sum(
-                self._calculate_scene_duration(s["narration"]) for s in scenes
-            )
-            if estimated_duration > self.generation_config.max_video_duration:
-                raise ValueError(
-                    f"Estimated duration {estimated_duration}s exceeds maximum allowed "
-                    f"{self.generation_config.max_video_duration}s"
-                )
-            
-            # Process scenes using pipeline approach
-            if callback:
-                callback(10, "Processing scenes")
-            
-            results = self._pipeline_processing(scenes)
-            
-            # Create video clips
-            if callback:
-                callback(70, "Creating video clips")
-            
-            video_clips = []
-            for i, (frames, audio_clip) in enumerate(results):
-                if not frames:
-                    continue
-                    
-                # Create video clip from frames
-                frame_duration = 1 / 24  # 24 FPS
-                clips = [ImageClip(np.array(frame)).set_duration(frame_duration) for frame in frames]
-                scene_clip = concatenate_videoclips(clips)
-                
-                # Add fade transitions if enabled
-                if add_transitions and i > 0:
-                    scene_clip = scene_clip.crossfadein(self.generation_config.transition_duration)
-                
-                video_clips.append(scene_clip)
-                
-                if callback:
-                    progress = 70 + (i / len(results)) * 15
-                    callback(int(progress), f"Created scene {i + 1}")
-            
-            # Render final video
-            if callback:
-                callback(85, "Rendering final video")
-            
-            output_path = self._render_final_video(
-                video_clips,
-                [r[1] for r in results],
-                output_filename,
-                callback
-            )
-            
-            # Verify output quality
-            if not self._safety_check(output_path):
-                raise RuntimeError("Generated video failed quality checks")
-            
-            return output_path
-            
-        except Exception as e:
-            logger.error(f"Video creation failed: {str(e)}")
-            raise
-    
-    def _render_final_video(
-        self,
-        video_clips: List[ImageClip],
-        audio_clips: List[AudioFileClip],
-        output_filename: str,
-        callback: Optional[Callable[[int, str], None]]
-    ) -> str:
-        """Render the final video file with quality controls"""
-        if callback:
-            callback(85, "Combining video clips")
-        
-        # Concatenate video clips with transitions
-        final_video = concatenate_videoclips(
-            video_clips,
-            method="compose",
-            padding=-self.generation_config.transition_duration if len(video_clips) > 1 else 0
-        )
-        
-        if callback:
-            callback(88, "Combining audio tracks")
-        
-        # Combine audio tracks with normalization
-        normalized_audio = [self._normalize_audio(a) for a in audio_clips]
-        final_audio = CompositeAudioClip(normalized_audio)
-        
-        # Add background music if enabled
-        if self.generation_config.enable_background_music:
-            if callback:
-                callback(90, "Adding background music")
-            
-            music = self.generate_background_music("neutral", final_video.duration)
-            
-            # Create AudioClip from music array with proper handling
-            def make_music_clip(t):
-                if t >= final_video.duration:
-                    return 0
-                idx = int(t * 22050)
-                if idx >= len(music):
-                    return 0
-                return music[idx]
-            
-            music_audio = AudioClip(
-                make_music_clip,
-                duration=final_video.duration,
-                fps=22050
-            ).fx(volumex, self.generation_config.music_volume)
-            
-            final_audio = CompositeAudioClip([final_audio, music_audio])
-        
-        if callback:
-            callback(92, "Final composition")
-        
-        # Set audio of the final video
-        final_video = final_video.set_audio(final_audio)
-        
-        # Determine encoding preset
-        preset = self._get_video_preset(len(video_clips))
-        
-        if callback:
-            callback(95, "Encoding video")
-        
-        # Write output file
-        output_path = os.path.join(self.temp_dir, output_filename)
-        final_video.write_videofile(
-            output_path,
-            fps=24,
-            codec='libx264',
-            audio_codec='aac',
-            threads=4,
-            logger=None,
-            bitrate="8000k",
-            preset=preset,
-            ffmpeg_params=[
-                '-movflags', '+faststart',  # Enable streaming
-                '-pix_fmt', 'yuv420p',      # Wider compatibility
-                '-crf', '18'                # High quality
-            ]
-        )
-        
-        # Clean up resources
-        for clip in video_clips + audio_clips:
-            clip.close()
-        final_video.close()
-        
-        if callback:
-            callback(100, "Video rendering complete")
-        
-        return output_path
-    
-    def generate_from_prompt(
-        self,
-        prompt: str,
-        output_filename: str = "output.mp4",
-        callback: Optional[Callable[[int, str], None]] = None,
-        **kwargs
-    ) -> str:
-        """Complete pipeline from text prompt to video with configurable parameters"""
-        logger.info(f"Generating script for prompt: {prompt}")
-        
-        if callback:
-            callback(0, "Generating script")
-        
-        # Update generation config if kwargs provided
-        if kwargs:
-            for key, value in kwargs.items():
-                if hasattr(self.generation_config, key):
-                    setattr(self.generation_config, key, value)
-        
-        script = self.generate_script(prompt)
-        logger.info(f"Generated script with {len(script)} scenes")
-        
-        if callback:
-            callback(10, "Script generated")
-        
-        logger.info("Creating video...")
-        video_path = self.create_video(script, output_filename, callback=callback)
-        logger.info(f"Video created at: {video_path}")
-        
-        return video_path
-    
-    def learn_from_url(self, url: str) -> str:
-        """Extract text content from a URL for context with improved parsing and validation"""
-        # Validate URL
-        if not re.match(r'^https?://', url):
-            logger.warning(f"Invalid URL format: {url}")
-            return ""
-        
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            response = self.requests_session.get(url, headers=headers, timeout=10)
-            
-            # Check if response is successful
-            if response.status_code != 200:
-                logger.warning(f"Failed to fetch URL: {response.status_code}")
-                return ""
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Remove unwanted elements
-            for element in soup(['script', 'style', 'nav', 'footer', 'iframe', 'noscript']):
-                element.decompose()
-            
-            # Get text from main content areas
-            paragraphs = []
-            for tag in ['article', 'main', 'div', 'p']:
-                elements = soup.find_all(tag)
-                for el in elements:
-                    text = el.get_text(separator=' ', strip=True)
-                    if len(text.split()) > 10:  # Only keep substantial paragraphs
-                        paragraphs.append(text)
-            
-            content = ' '.join(paragraphs)
-            
-            # Clean up excessive whitespace
-            content = re.sub(r'\s+', ' ', content).strip()
-            return content[:5000]  # Limit to 5000 characters
-        except Exception as e:
-            logger.error(f"Error learning from {url}: {str(e)}")
-            return ""
-    
-    def cleanup(self):
-        """Clean up temporary files with error handling"""
-        try:
-            # Unload models first to free memory
-            self.unload_models()
-            
-            # Clean up temporary files
-            for file in os.listdir(self.temp_dir):
-                try:
-                    os.remove(os.path.join(self.temp_dir, file))
-                except Exception as e:
-                    logger.warning(f"Could not delete temporary file {file}: {str(e)}")
-            
-            try:
-                os.rmdir(self.temp_dir)
-                logger.info("Cleaned up temporary files")
-            except Exception as e:
-                logger.warning(f"Could not remove temporary directory: {str(e)}")
-                
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
-    
-    def save_config(self, filepath: str):
-        """Save current configuration to file"""
-        config = {
-            "model_config": {
-                "text_model": self.model_config.text_model.value,
-                "tts_model": self.model_config.tts_model.value,
-                "image_model": self.model_config.image_model.value
-            },
-            "generation_config": {
-                "video_length": self.generation_config.video_length,
-                "min_scene_duration": self.generation_config.min_scene_duration,
-                "max_scene_duration": self.generation_config.max_scene_duration,
-                "transition_duration": self.generation_config.transition_duration,
-                "image_width": self.generation_config.image_width,
-                "image_height": self.generation_config.image_height,
-                "image_steps": self.generation_config.image_steps,
-                "image_cfg_scale": self.generation_config.image_cfg_scale,
-                "tts_sampling_rate": self.generation_config.tts_sampling_rate,
-                "text_model_temp": self.generation_config.text_model_temp,
-                "seed": self.generation_config.seed,
-                "enable_safety_checker": self.generation_config.enable_safety_checker,
-                "max_workers": self.generation_config.max_workers,
-                "enable_animation": self.generation_config.enable_animation,
-                "enable_character_consistency": self.generation_config.enable_character_consistency,
-                "enable_background_music": self.generation_config.enable_background_music,
-                "music_volume": self.generation_config.music_volume,
-                "max_video_duration": self.generation_config.max_video_duration,
-                "target_audio_db": self.generation_config.target_audio_db,
-                "tts_voice": self.generation_config.tts_voice,
-                "tts_speed": self.generation_config.tts_speed,
-                "image_cache_size": self.generation_config.image_cache_size,
-                "use_disk_cache": self.generation_config.use_disk_cache,
-                "low_cpu_mem_usage": self.generation_config.low_cpu_mem_usage
-            }
-        }
-        
-        with open(filepath, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        logger.info(f"Configuration saved to {filepath}")
-    
-    def load_config(self, filepath: str):
-        """Load configuration from file"""
-        with open(filepath, 'r') as f:
-            config = json.load(f)
-        
-        # Update model config
-        self.model_config.text_model = ModelType(config["model_config"]["text_model"])
-        self.model_config.tts_model = ModelType(config["model_config"]["tts_model"])
-        self.model_config.image_model = ModelType(config["model_config"]["image_model"])
-        
-        # Update generation config
-        for key, value in config["generation_config"].items():
-            setattr(self.generation_config, key, value)
-        
-        # Re-validate config
-        self._validate_config()
-        
-        logger.info(f"Configuration loaded from {filepath}")
+        config: Optional[GenerationConfig] = None,
+        progress: Optional[ProgressCallback] = None,
+    ) -> None:
+        self.config = config or GenerationConfig()
+        self.progress: ProgressCallback = progress or (lambda pct, msg: None)
+        self.store = ScriptStore(self.config.scripts_dir)
+        self.scripter = StoryScripter(self.config)
 
-# Example usage with all enhancements
-if __name__ == "__main__":
-    def progress_callback(percent: int, message: str):
-        print(f"[{percent}%] {message}")
-    
-    # Configuration with all enhanced settings
-    config = GenerationConfig(
-        video_length=60.0,
-        min_scene_duration=4.0,
-        max_scene_duration=15.0,
-        transition_duration=1.0,
-        image_width=1024,
-        image_height=576,
-        image_steps=30,
-        enable_animation=True,
-        enable_character_consistency=True,
-        enable_background_music=True,
-        music_volume=0.15,
-        target_audio_db=-16.0,
-        max_video_duration=300.0,  # 5 minute limit
-        tts_voice="female",
-        tts_speed=1.2,
-        image_cache_size=30,
-        use_disk_cache=True,
-        low_cpu_mem_usage=False  # Changed to False to fix meta tensor issues
-    )
-    
-    generator = FreeTextToVideoGenerator(generation_config=config)
-    
-    try:
-        # Save configuration
-        generator.save_config("video_config.json")
-        
-        # Generate a complex video with all features
-        result = generator.generate_from_prompt(
-            "A futuristic city where robots and humans coexist peacefully",
-            "futuristic_city.mp4",
-            callback=progress_callback,
-            enable_animation=True,
-            enable_character_consistency=True
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        self.image_cache_dir = self.config.cache_dir / "images"
+        self.image_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Scratch space for intermediate audio only.  Nothing the user keeps is
+        # ever written here -- the original wrote the finished MP4 into the temp
+        # dir and then deleted that directory on exit.
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="video_gen_"))
+        self._cleaned = False
+
+        self.device = self._select_device()
+        self._image_pipe = None
+        self._image_pipe_failed = False
+        self._tts = None
+        self._tts_failed = False
+
+        if HAS_TORCH and self.device == "cpu":  # pragma: no cover
+            torch.set_num_threads(max(1, os.cpu_count() or 1))
+
+        atexit.register(self.cleanup)
+        LOGGER.info(
+            "device=%s preset=%s resolution=%dx%d capabilities=%s",
+            self.device,
+            self.config.preset,
+            self.config.resolution[0],
+            self.config.resolution[1],
+            capability_report(),
         )
-        
-        print(f"\nSuccessfully created video: {result}")
-        print(f"Video duration: {VideoFileClip(result).duration:.1f} seconds")
-        
-        # Demonstrate model switching
-        print("\nSwitching to larger image model for higher quality...")
-        generator.switch_model("image", ModelType.LARGE)
-        
-        # Generate another video with the new model
-        result2 = generator.generate_from_prompt(
-            "A beautiful landscape with mountains and a lake",
-            "landscape.mp4",
-            callback=progress_callback
-        )
-        
-        print(f"\nSuccessfully created second video: {result2}")
-        print(f"Video duration: {VideoFileClip(result2).duration:.1f} seconds")
-        
-        # Learn from a URL and generate context-aware video
-        context = generator.learn_from_url("https://en.wikipedia.org/wiki/Artificial_intelligence")
-        if context:
-            print(f"\nLearned context ({len(context)} characters)")
-            
-            # Generate video with context
-            context_video_path = generator.generate_from_prompt(
-                f"Explain {context[:200]} in simple terms",
-                "ai_explanation.mp4",
-                callback=progress_callback
+
+    # -- lifecycle --------------------------------------------------------- #
+
+    @staticmethod
+    def _select_device() -> str:
+        if not HAS_TORCH:
+            return "cpu"
+        try:  # pragma: no cover - hardware dependent
+            if torch.cuda.is_available():
+                return "cuda"
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                return "mps"
+        except Exception:  # noqa: BLE001
+            pass
+        return "cpu"
+
+    def cleanup(self) -> None:
+        """Idempotent teardown.  Only ever removes the scratch directory."""
+        if self._cleaned:
+            return
+        self._cleaned = True
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def unload_models(self) -> None:
+        self._image_pipe = None
+        self._tts = None
+        if HAS_TORCH and self.device == "cuda":  # pragma: no cover
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def __enter__(self) -> "FreeTextToVideoGenerator":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.cleanup()
+
+    # -- scripting --------------------------------------------------------- #
+
+    def propose_scripts(self, story: str) -> List[VideoScript]:
+        """Generate candidates and persist them all as ``status: candidate``."""
+        scripts = self.scripter.generate_candidates(story)
+        for script in scripts:
+            self.store.save(script)
+        return scripts
+
+    def accept_script(self, script: VideoScript) -> Path:
+        return self.store.accept(script)
+
+    # -- image generation -------------------------------------------------- #
+
+    @property
+    def image_pipe(self):
+        if self._image_pipe is None and not self._image_pipe_failed:
+            self._image_pipe = self._load_image_model()
+            self._image_pipe_failed = self._image_pipe is None
+        return self._image_pipe
+
+    def _load_image_model(self):  # pragma: no cover - requires model download
+        if not HAS_DIFFUSERS:
+            LOGGER.info("diffusers/torch unavailable; using procedural scene cards")
+            return None
+        model_id = str(self.config.preset_data["model"])
+        try:
+            from diffusers import AutoPipelineForText2Image
+
+            # fp16 only helps on CUDA; on CPU it is emulated and *slower*, and
+            # MPS needs fp32 for several of the SD ops.
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
+            pipe = AutoPipelineForText2Image.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                safety_checker=None,
+                requires_safety_checker=False,
             )
-            
-            print(f"\nContext-aware video saved at: {context_video_path}")
-            print(f"File size: {os.path.getsize(context_video_path) / (1024*1024):.2f} MB")
-        
-    except Exception as e:
-        print(f"\nError during video generation: {str(e)}")
-    
-    finally:
-        generator.cleanup()
+            pipe = pipe.to(self.device)
+            pipe.set_progress_bar_config(disable=True)
+            try:
+                pipe.enable_attention_slicing()
+                if self.device == "cpu":
+                    pipe.enable_vae_slicing()
+            except Exception:  # noqa: BLE001 - optional memory optimisations
+                pass
+            LOGGER.info("loaded image model %s on %s (%s)", model_id, self.device, dtype)
+            return pipe
+        except Exception as exc:  # noqa: BLE001
+            # Non-fatal but *loud*: the original swallowed this silently and
+            # then rendered black frames for the entire video.
+            LOGGER.warning(
+                "could not load image model %s (%s); falling back to procedural scene "
+                "cards -- run `pip install -r requirements-ml.txt` for AI visuals",
+                model_id,
+                exc,
+            )
+            return None
+
+    def generate_image(self, prompt: str, seed_salt: int = 0) -> Image.Image:
+        """One still per scene.  Disk-cached across runs by (prompt, preset, seed)."""
+        preset = self.config.preset_data
+        size = int(preset["image_size"])  # type: ignore[arg-type]
+        key = hashlib.sha1(
+            f"{prompt}|{self.config.preset}|{self.config.seed}|{seed_salt}|{size}".encode("utf-8")
+        ).hexdigest()
+        cached = self.image_cache_dir / f"{key}.png"
+        if cached.exists():
+            try:
+                with Image.open(cached) as handle:
+                    return handle.convert("RGB")
+            except Exception:  # noqa: BLE001 - corrupt cache entry
+                cached.unlink(missing_ok=True)
+
+        seed = (self.config.seed + _stable_seed(prompt, seed_salt)) % (2**31 - 1)
+        pipe = self.image_pipe
+        image: Optional[Image.Image] = None
+        if pipe is not None:  # pragma: no cover - requires model download
+            try:
+                kwargs = {
+                    "prompt": prompt,
+                    "num_inference_steps": int(preset["steps"]),  # type: ignore[arg-type]
+                    "guidance_scale": float(preset["guidance"]),  # type: ignore[arg-type]
+                    "width": size,
+                    "height": size,
+                    # A per-call generator is both reproducible and thread-safe,
+                    # unlike the global torch.manual_seed the original used.
+                    "generator": torch.Generator(device="cpu").manual_seed(seed),
+                }
+                # Turbo checkpoints run with CFG disabled, where a negative
+                # prompt is not merely useless -- the pipeline rejects it.
+                if float(preset["guidance"]) > 1.0 and preset["negative_prompt"]:
+                    kwargs["negative_prompt"] = preset["negative_prompt"]
+                image = pipe(**kwargs).images[0]
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("image generation failed (%s); using scene card", exc)
+                image = None
+
+        if image is None:
+            # The palette seed is per-video, so all the cards in one render
+            # share a colour family instead of jumping hue at every cut.
+            image = self.render_scene_card(
+                prompt, seed, (size, size), palette_seed=self.config.seed
+            )
+
+        try:
+            image.save(cached)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("could not cache image: %s", exc)
+        return image
+
+    # -- procedural fallback visuals --------------------------------------- #
+
+    @staticmethod
+    def render_scene_card(
+        prompt: str,
+        seed: int,
+        size: Tuple[int, int],
+        palette_seed: Optional[int] = None,
+    ) -> Image.Image:
+        """A composed abstract card, used when no image model is loaded.
+
+        This is what makes the pipeline genuinely runnable with zero downloads.
+        It is not photoreal, but it is deliberately designed: a graded sky, a
+        soft horizon with layered atmospheric ridges, a light source, grain and
+        a vignette.
+
+        ``palette_seed`` is shared by every scene in one video, and each scene
+        only shifts the hue slightly from it.  Without that, consecutive scenes
+        pick unrelated hues and the cuts read as glitches rather than as a
+        deliberate look.
+        """
+        width, height = size
+        rng = np.random.default_rng(seed)
+        palette_rng = np.random.default_rng(seed if palette_seed is None else palette_seed)
+
+        def hsv_rgb(h: float, s: float, v: float) -> np.ndarray:
+            swatch = Image.new("HSV", (1, 1), (int(h * 255) % 256, int(s), int(v)))
+            return np.array(swatch.convert("RGB").getpixel((0, 0)), dtype=np.float32)
+
+        # One family hue for the whole video; scenes vary within a narrow arc.
+        hue = float(palette_rng.uniform(0, 1)) + float(rng.uniform(-0.055, 0.055))
+        warm = hue + 0.5 + float(palette_rng.uniform(-0.05, 0.05))  # complement
+
+        yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+        v_norm = yy / max(1, height - 1)
+
+        # Sky: bright near the horizon, deeper overhead.
+        c_high = hsv_rgb(hue, palette_rng.uniform(150, 210), 120)
+        c_low = hsv_rgb(hue - 0.04, palette_rng.uniform(90, 150), 225)
+        horizon = float(rng.uniform(0.52, 0.72))
+        sky_ramp = np.clip(v_norm / horizon, 0, 1)[..., None] ** 1.4
+        canvas = c_high[None, None, :] * (1 - sky_ramp) + c_low[None, None, :] * sky_ramp
+
+        # A low sun near the horizon anchors the composition.
+        sun_x = float(rng.uniform(0.2, 0.8)) * width
+        sun_y = horizon * height - float(rng.uniform(0.02, 0.12)) * height
+        sun_r = float(rng.uniform(0.10, 0.20)) * max(width, height)
+        glow = np.exp(-(((xx - sun_x) ** 2 + (yy - sun_y) ** 2) / (2 * sun_r**2)))
+        canvas += glow[..., None] * hsv_rgb(warm, 90, 255)[None, None, :] * 0.55
+
+        # Layered ridges below the horizon: each darker and closer to the eye.
+        for layer in range(int(rng.integers(2, 4))):
+            depth = (layer + 1) / 4.0
+            crest = horizon + depth * float(rng.uniform(0.05, 0.13))
+            wobble = (
+                np.sin(xx / width * np.pi * float(rng.uniform(1.0, 2.6)) + rng.uniform(0, 6.28))
+                * float(rng.uniform(0.012, 0.035))
+            )
+            edge = (crest + wobble) * height
+            # Clipped so the sigmoid saturates cleanly instead of overflowing.
+            ramp = np.clip((yy - edge) / max(1.0, height * 0.006), -60.0, 60.0)
+            mask = 1.0 / (1.0 + np.exp(-ramp))
+            shade = hsv_rgb(hue + 0.02 * layer, 170, 90 - 22 * layer)
+            canvas = canvas * (1 - mask[..., None] * 0.92) + shade[None, None, :] * (
+                mask[..., None] * 0.92
+            )
+
+        # Vignette, then fine grain so flat areas do not band after H.264.
+        dx = (xx / width - 0.5) * 2
+        dy = (yy / height - 0.5) * 2
+        canvas *= (1.0 - 0.40 * np.clip(dx**2 + dy**2, 0, 1))[..., None]
+        canvas += rng.normal(0, 3.2, canvas.shape).astype(np.float32)
+
+        image = Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8))
+        return image.filter(ImageFilter.GaussianBlur(radius=max(width, height) / 500.0))
+
+    # -- typography -------------------------------------------------------- #
+
+    @staticmethod
+    def _load_font(size: int) -> ImageFont.ImageFont:
+        candidates = [
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:  # noqa: BLE001
+                    continue
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:  # Pillow < 10.1
+            return ImageFont.load_default()
+
+    def build_overlay(
+        self, text: str
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int]]]:
+        """Pre-render a lower-third caption once per scene.
+
+        Returns ``(rgb, alpha, bbox)`` limited to the caption's bounding box, so
+        per-frame compositing touches a slice rather than the whole frame.
+        """
+        text = " ".join(text.split())
+        if not text:
+            return None
+        width, height = self.config.resolution
+        font_size = max(16, int(height * 0.042))
+        font = self._load_font(font_size)
+
+        # Wrap to ~86% of frame width using real glyph metrics.
+        max_width = int(width * 0.86)
+        lines: List[str] = []
+        current = ""
+        for word in text.split():
+            trial = f"{current} {word}".strip()
+            if not current or font.getbbox(trial)[2] <= max_width:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        if len(lines) > 3:  # keep captions to three lines, ellipsise the rest
+            lines = lines[:3]
+            lines[-1] = lines[-1].rstrip(" ,.") + "…"
+
+        line_height = int(font_size * 1.32)
+        pad = int(font_size * 0.62)
+        box_h = min(height, line_height * len(lines) + pad * 2)
+        box_w = min(width, max(font.getbbox(l)[2] for l in lines) + pad * 2)
+        x0 = max(0, (width - box_w) // 2)
+        y0 = max(0, height - box_h - int(height * 0.055))
+
+        layer = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        draw.rounded_rectangle(
+            [0, 0, box_w - 1, box_h - 1], radius=int(font_size * 0.35), fill=(8, 10, 14, 170)
+        )
+        for i, line in enumerate(lines):
+            tx = (box_w - font.getbbox(line)[2]) // 2
+            ty = pad + i * line_height
+            draw.text((tx + 2, ty + 2), line, font=font, fill=(0, 0, 0, 190))  # shadow
+            draw.text((tx, ty), line, font=font, fill=(245, 246, 250, 255))
+
+        arr = np.asarray(layer, dtype=np.float32)
+        return arr[..., :3], arr[..., 3:4] / 255.0, (x0, y0, box_w, box_h)
+
+    # -- Ken Burns --------------------------------------------------------- #
+
+    def make_scene_clip(
+        self, image: Image.Image, duration: float, seed: int, overlay_text: str = ""
+    ) -> VideoClip:
+        """A standalone clip for one scene (used by tests and single-scene renders)."""
+        duration = max(0.1, float(duration))
+        return VideoClip(
+            frame_function=self.make_scene_renderer(image, duration, seed, overlay_text),
+            duration=duration,
+        )
+
+    def make_scene_renderer(
+        self, image: Image.Image, duration: float, seed: int, overlay_text: str = ""
+    ) -> Callable[[float], np.ndarray]:
+        """Animate one still with a slow crop-and-zoom (Ken Burns).
+
+        This replaces the original five-diffusion-calls-plus-pixel-interpolation
+        approach: one inference per scene, and the motion costs a crop and a
+        resize per frame rather than another model call.
+
+        Returns the bare frame function rather than a clip so that the whole
+        video can be assembled as a *single* ``VideoClip``.  Routing scenes
+        through moviepy's ``concatenate_videoclips(method="compose")`` instead
+        costs 4x more wall-clock, because it drives its mask-blitting path for
+        every frame and not just the ones inside a crossfade.
+        """
+        out_w, out_h = self.config.resolution
+        zoom = 1.18  # oversample factor -- the slack we pan and zoom inside
+
+        big_w, big_h = int(out_w * zoom), int(out_h * zoom)
+        base = self._cover_resize(image, (big_w, big_h))
+
+        rng = np.random.default_rng(seed)
+        s0, s1 = (zoom, 1.0) if rng.integers(0, 2) else (1.0, zoom)
+        # Pan endpoints as normalised positions within the slack area.
+        p0 = (float(rng.uniform(0, 1)), float(rng.uniform(0, 1)))
+        p1 = (float(rng.uniform(0, 1)), float(rng.uniform(0, 1)))
+
+        overlay = self.build_overlay(overlay_text) if self.config.overlays else None
+        duration = max(0.1, float(duration))
+
+        def frame_function(t: float) -> np.ndarray:
+            # Smoothstep easing: no visible jerk at the scene boundaries.
+            u = min(1.0, max(0.0, t / duration))
+            eased = u * u * (3.0 - 2.0 * u)
+
+            scale = s0 + (s1 - s0) * eased
+            crop_w = min(big_w, max(2, int(round(out_w * scale))))
+            crop_h = min(big_h, max(2, int(round(out_h * scale))))
+            px = p0[0] + (p1[0] - p0[0]) * eased
+            py = p0[1] + (p1[1] - p0[1]) * eased
+            x = int(round(px * (big_w - crop_w)))
+            y = int(round(py * (big_h - crop_h)))
+
+            window = base.resize(
+                (out_w, out_h), Image.BILINEAR, box=(x, y, x + crop_w, y + crop_h)
+            )
+            frame = np.asarray(window, dtype=np.uint8)
+
+            if overlay is not None:
+                rgb, alpha, (x0, y0, bw, bh) = overlay
+                frame = frame.copy()
+                region = frame[y0 : y0 + bh, x0 : x0 + bw].astype(np.float32)
+                frame[y0 : y0 + bh, x0 : x0 + bw] = (
+                    region * (1.0 - alpha) + rgb * alpha
+                ).astype(np.uint8)
+            return frame
+
+        return frame_function
+
+    @staticmethod
+    def _cover_resize(image: Image.Image, size: Tuple[int, int]) -> Image.Image:
+        """Scale to fully cover ``size``, centre-cropping the overflow."""
+        target_w, target_h = size
+        src_w, src_h = image.size
+        scale = max(target_w / src_w, target_h / src_h)
+        new = image.convert("RGB").resize(
+            (
+                max(target_w, int(math.ceil(src_w * scale))),
+                max(target_h, int(math.ceil(src_h * scale))),
+            ),
+            Image.LANCZOS,
+        )
+        left = (new.width - target_w) // 2
+        top = (new.height - target_h) // 2
+        return new.crop((left, top, left + target_w, top + target_h))
+
+    # -- speech ------------------------------------------------------------ #
+
+    @property
+    def tts(self):
+        if self._tts is None and not self._tts_failed:
+            self._tts = self._load_tts()
+            self._tts_failed = self._tts is None
+        return self._tts
+
+    def _load_tts(self):  # pragma: no cover - requires model download
+        if not HAS_TRANSFORMERS:
+            return None
+        try:
+            from transformers import AutoTokenizer, VitsModel
+
+            model = VitsModel.from_pretrained("facebook/mms-tts-eng").to("cpu").eval()
+            tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
+            LOGGER.info("loaded neural TTS facebook/mms-tts-eng")
+            return model, tokenizer
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("neural TTS unavailable (%s); trying system voice", exc)
+            return None
+
+    def generate_speech(self, text: str, out_path: Path) -> Tuple[Path, float]:
+        """Synthesise narration, returning the file and its *real* duration.
+
+        Fallback chain: MMS-TTS (neural) -> OS synthesiser -> timed silence.
+        The measured length is returned so the caller can make it the source of
+        truth for scene length instead of guessing from word count.
+        """
+        text = " ".join(text.split())
+        if not text:
+            return self._silence(out_path, MIN_SCENE_SECONDS)
+
+        model_pair = self.tts
+        if model_pair is not None:  # pragma: no cover - requires model download
+            try:
+                model, tokenizer = model_pair
+                inputs = tokenizer(text, return_tensors="pt")
+                with torch.no_grad():
+                    waveform = model(**inputs).waveform
+                samples = waveform.squeeze().cpu().numpy().astype(np.float32)
+                # The rate comes from the checkpoint; hardcoding 16 kHz (as the
+                # original did) detunes and mistimes every single line.
+                rate = int(model.config.sampling_rate)
+                samples = self._apply_rate(samples, self.config.voice_rate)
+                _write_wav(out_path, self._normalize(samples), rate)
+                return out_path, len(samples) / rate
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("neural TTS failed (%s); trying system voice", exc)
+
+        system = self._system_speech(text, out_path)
+        if system is not None:
+            return system
+        # Silence sized to a natural reading pace keeps captions readable even
+        # when no synthesiser at all is available.
+        return self._silence(out_path, StoryScripter.estimate_duration(text, 150))
+
+    def _system_speech(self, text: str, out_path: Path) -> Optional[Tuple[Path, float]]:
+        command = _system_tts_command()
+        if command is None:
+            return None
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if command == "say":
+                argv = [
+                    "say", "-r", str(int(180 * self.config.voice_rate)),
+                    "--data-format=LEI16@22050", "-o", str(out_path), text,
+                ]
+            else:
+                argv = [
+                    command, "-s", str(int(165 * self.config.voice_rate)),
+                    "-w", str(out_path), text,
+                ]
+            subprocess.run(argv, check=True, capture_output=True, timeout=180)
+            with AudioFileClip(str(out_path)) as clip:
+                duration = float(clip.duration)
+            if duration <= 0.05:
+                return None
+            return out_path, duration
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("system TTS (%s) failed: %s", command, exc)
+            return None
+
+    def _silence(self, out_path: Path, duration: float) -> Tuple[Path, float]:
+        rate = 22050
+        _write_wav(out_path, np.zeros(int(rate * duration), dtype=np.float32), rate)
+        return out_path, duration
+
+    @staticmethod
+    def _apply_rate(samples: np.ndarray, rate: float) -> np.ndarray:
+        """Resampling speed change (pitch shifts slightly, as expected)."""
+        if abs(rate - 1.0) < 1e-3 or samples.size == 0:
+            return samples
+        target_len = max(1, int(len(samples) / rate))
+        src = np.linspace(0, len(samples) - 1, num=target_len)
+        return np.interp(src, np.arange(len(samples)), samples).astype(np.float32)
+
+    @staticmethod
+    def _normalize(samples: np.ndarray, peak: float = 0.89) -> np.ndarray:
+        if samples.size == 0:
+            return samples
+        current = float(np.max(np.abs(samples)))
+        if current < 1e-6:
+            return samples
+        return (samples * (peak / current)).astype(np.float32)
+
+    # -- music ------------------------------------------------------------- #
+
+    def generate_music(self, duration: float, seed: int) -> Optional[AudioArrayClip]:
+        """A synthesised pad underscore -- no model, no download, no licensing."""
+        if not self.config.music or duration <= 0.2:
+            return None
+        rate = 44100
+        rng = np.random.default_rng(seed)
+        root = float(rng.choice([110.0, 123.47, 130.81, 146.83, 164.81]))
+        # i - VI - III - VII: minor and unresolved, so it stays out of the way
+        # of the narration instead of competing with it.
+        progression = [
+            (1.0, 1.2, 1.5), (0.8, 1.0, 1.2), (1.2, 1.5, 1.8), (0.9, 1.125, 1.35),
+        ]
+        bar = 4.0
+        total = int(rate * duration)
+        out = np.zeros(total, dtype=np.float32)
+        t_bar = np.arange(int(rate * bar), dtype=np.float32) / rate
+        # Slow attack/release so chord changes glide instead of clicking.
+        env = np.clip(np.minimum(t_bar / 0.9, np.minimum(1.0, (bar - t_bar) / 1.2)), 0.0, 1.0)
+
+        cursor = 0
+        index = 0
+        while cursor < total:
+            wave = np.zeros_like(t_bar)
+            for harmonic, ratio in enumerate(progression[index % len(progression)]):
+                freq = root * ratio
+                wave += np.sin(2 * np.pi * freq * t_bar) * (0.5**harmonic)
+                wave += 0.25 * np.sin(4 * np.pi * freq * t_bar) * (0.5**harmonic)
+            wave *= env
+            chunk = wave[: total - cursor]
+            out[cursor : cursor + len(chunk)] += chunk
+            cursor += len(chunk)
+            index += 1
+
+        out = self._normalize(out, peak=1.0) * self.config.music_volume
+        fade = int(rate * 1.5)  # do not slam the bed on at t=0
+        if total > 2 * fade:
+            out[:fade] *= np.linspace(0, 1, fade)
+            out[-fade:] *= np.linspace(1, 0, fade)
+        return AudioArrayClip(np.stack([out, out], axis=1), fps=rate)
+
+    # -- render ------------------------------------------------------------ #
+
+    def render(self, script: VideoScript, output: Optional[Path] = None) -> Path:
+        """Render a script to MP4 and record the result back into its file."""
+        if not script.scenes:
+            raise ValueError("script has no scenes")
+        output = Path(output) if output else self.config.output_dir / f"{script.id}.mp4"
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        started = time.time()
+        per_scene: List[float] = []
+        renderers: List[Callable[[float], np.ndarray]] = []
+        durations: List[float] = []
+        audio_clips: List[AudioFileClip] = []
+        total = len(script.scenes)
+
+        try:
+            for i, scene in enumerate(script.scenes):
+                scene_started = time.time()
+                self.progress(i / total * 90.0, f"Scene {i + 1}/{total}: narration")
+
+                wav = self.temp_dir / f"scene_{i:03d}.wav"
+                _, narration_seconds = self.generate_speech(scene.narration, wav)
+                # Real audio length drives scene length.  The original computed
+                # the video duration first and then time-stretched the audio,
+                # which accumulated A/V drift across the whole video.
+                duration = max(MIN_SCENE_SECONDS, narration_seconds + SCENE_TAIL_PAD)
+                scene.duration = round(duration, 2)
+
+                self.progress((i + 0.35) / total * 90.0, f"Scene {i + 1}/{total}: visual")
+                image = self.generate_image(scene.visual, seed_salt=scene.index)
+
+                self.progress((i + 0.75) / total * 90.0, f"Scene {i + 1}/{total}: animating")
+                renderers.append(
+                    self.make_scene_renderer(
+                        image,
+                        duration,
+                        seed=self.config.seed + scene.index,
+                        overlay_text=scene.overlay or scene.narration,
+                    )
+                )
+                durations.append(duration)
+                narration = AudioFileClip(str(wav))
+                if narration.duration > duration:
+                    narration = narration.subclipped(0, duration)
+                audio_clips.append(narration)
+                per_scene.append(round(time.time() - scene_started, 2))
+
+            self.progress(92.0, "Assembling timeline")
+            fade = self._crossfade_for(durations)
+            video = self.build_timeline(renderers, durations, fade)
+
+            # Each narration is pinned to the start of *its own* scene on the
+            # crossfaded timeline.  Naively concatenating the audio instead
+            # would drift by `fade` per scene, because every crossfade overlaps
+            # two clips and shortens the video by that much.
+            tracks = [
+                narration.with_effects(
+                    [afx.AudioFadeIn(0.05), afx.AudioFadeOut(0.12)]
+                ).with_start(start)
+                for narration, start in zip(audio_clips, self._scene_starts(durations, fade))
+            ]
+            music = self.generate_music(video.duration, seed=self.config.seed)
+            if music is not None:
+                tracks.append(music.with_duration(video.duration))
+            video = video.with_audio(CompositeAudioClip(tracks).with_duration(video.duration))
+            rendered_seconds = round(float(video.duration), 2)
+
+            self.progress(95.0, "Encoding")
+            self._encode(video, output)
+        finally:
+            for clip in audio_clips:
+                try:
+                    clip.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        elapsed = round(time.time() - started, 2)
+        self.store.record_render(
+            script,
+            {
+                "output": str(output),
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "preset": self.config.preset,
+                "resolution": f"{self.config.resolution[0]}x{self.config.resolution[1]}",
+                # Real encoded length, which is shorter than the sum of the
+                # scene durations by one crossfade per cut.
+                "duration_s": rendered_seconds,
+                "elapsed_s": elapsed,
+                "per_scene_s": per_scene,
+                "backends": capability_report(),
+            },
+        )
+        self.progress(100.0, f"Done: {output}")
+        return output
+
+    @staticmethod
+    def _crossfade_for(durations: Sequence[float]) -> float:
+        """Crossfade length, capped so it can never swallow a short scene."""
+        if len(durations) < 2:
+            return 0.0
+        fade = min(CROSSFADE_SECONDS, min(durations) / 3.0)
+        return fade if fade > 0.05 else 0.0
+
+    @staticmethod
+    def _scene_starts(durations: Sequence[float], fade: float) -> List[float]:
+        """Start time of each scene on the assembled (overlapping) timeline."""
+        starts: List[float] = []
+        cursor = 0.0
+        for duration in durations:
+            starts.append(cursor)
+            cursor += duration - fade
+        return starts
+
+    def build_timeline(
+        self,
+        renderers: Sequence[Callable[[float], np.ndarray]],
+        durations: Sequence[float],
+        fade: float,
+    ) -> VideoClip:
+        """Assemble every scene into one clip, crossfading between them.
+
+        Doing the dissolve arithmetic here keeps the cost proportional to the
+        overlap: only frames actually inside a crossfade render two scenes.
+        """
+        starts = self._scene_starts(durations, fade)
+        total = starts[-1] + durations[-1]
+        last = len(renderers) - 1
+
+        def frame_function(t: float) -> np.ndarray:
+            # Index of the last scene that has started by t.
+            index = 0
+            for i, start in enumerate(starts):
+                if t >= start:
+                    index = i
+                else:
+                    break
+            index = min(index, last)
+            frame = renderers[index](t - starts[index])
+
+            # Inside the overlap the previous scene is still on screen.
+            if fade > 0 and index > 0 and t < starts[index - 1] + durations[index - 1]:
+                alpha = min(1.0, max(0.0, (t - starts[index]) / fade))
+                previous = renderers[index - 1](t - starts[index - 1])
+                frame = (
+                    previous.astype(np.float32) * (1.0 - alpha)
+                    + frame.astype(np.float32) * alpha
+                ).astype(np.uint8)
+            return frame
+
+        return VideoClip(frame_function=frame_function, duration=total)
+
+    def _encode(self, video: VideoClip, output: Path) -> None:
+        video.write_videofile(
+            str(output),
+            fps=self.config.fps,
+            codec="libx264",
+            audio_codec="aac",
+            audio_bitrate="192k",
+            preset="medium",
+            threads=max(1, os.cpu_count() or 1),
+            temp_audiofile=str(self.temp_dir / "mux_audio.m4a"),
+            logger=None,
+            # CRF is the quality target.  Passing `bitrate=` as well (as the
+            # original did) makes the two settings fight and x264 drops one.
+            ffmpeg_params=[
+                "-crf", str(self.config.preset_data["crf"]),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+            ],
+        )
+
+    # -- convenience ------------------------------------------------------- #
+
+    def generate_from_story(
+        self, story: str, variant: str = "Cinematic", output: Optional[Path] = None
+    ) -> Tuple[VideoScript, Path]:
+        """Non-interactive one-shot: story -> chosen variant -> MP4."""
+        scripts = self.propose_scripts(story)
+        chosen = next((s for s in scripts if s.variant == variant), scripts[0])
+        self.accept_script(chosen)
+        return chosen, self.render(chosen, output)
+
+    SELF_TEST_STORY = (
+        "The lighthouse keeper had not seen a ship in forty years. "
+        "Every night he lit the lamp anyway, and every morning he wrote the date "
+        "in his ledger. On the fourth of October a sail appeared on the horizon. "
+        "He did not trust his eyes, so he waited until noon. "
+        "The ship was still there, and it was coming closer."
+    )
+
+    def self_test(self, output: Optional[Path] = None) -> Path:
+        """Run the full pipeline on a fixed story with zero network access."""
+        script = self.scripter.generate_candidates(
+            self.SELF_TEST_STORY, variants=["Cinematic"]
+        )[0]
+        script.id = "self-test"
+        script.title = "Self Test"
+        self.store.save(script)
+        self.accept_script(script)
+        return self.render(script, output or self.config.output_dir / "self_test.mp4")
+
+
+# --------------------------------------------------------------------------- #
+# Interactive wizard
+# --------------------------------------------------------------------------- #
+
+
+def _is_interactive() -> bool:
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def _ask(prompt: str, default: str = "", assume_yes: bool = False) -> str:
+    """Prompt helper that degrades to defaults when non-interactive or --yes."""
+    if assume_yes or not _is_interactive():
+        return default
+    try:
+        answer = input(f"{prompt} [{default}] " if default else f"{prompt} ").strip()
+    except EOFError:
+        return default
+    return answer or default
+
+
+def _read_story() -> str:
+    print("\nWrite your short story. Finish with an empty line.\n")
+    lines: List[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip() and lines:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _print_candidates(scripts: Sequence[VideoScript]) -> None:
+    print("\n" + "=" * 74)
+    print("CANDIDATE SCRIPTS — pick the one your video should be based on")
+    print("=" * 74)
+    for i, script in enumerate(scripts, start=1):
+        feel = VARIANTS.get(script.variant, {}).get("feel", "")
+        print(
+            f"\n[{i}] {script.variant}  ·  {len(script.scenes)} scenes  ·  "
+            f"~{script.estimated_duration:.0f}s  ·  {script.id}"
+        )
+        print(f"    {feel}")
+        for scene in script.scenes[:2]:
+            print(f"    Scene {scene.index}: {textwrap.shorten(scene.narration, 62)}")
+            print(f"       visual: {textwrap.shorten(scene.visual, 62)}")
+        if len(script.scenes) > 2:
+            print(f"    … {len(script.scenes) - 2} more scene(s)")
+    print("\n" + "-" * 74)
+
+
+def run_wizard(
+    config: GenerationConfig, story: str = "", assume_yes: bool = False
+) -> Optional[Path]:
+    caps = capability_report()
+    visuals = (
+        "Stable Diffusion"
+        if caps["diffusers"]
+        else "procedural scene cards (pip install -r requirements-ml.txt for AI visuals)"
+    )
+    narration = (
+        "neural TTS"
+        if caps["transformers"]
+        else ("system voice" if caps["system_tts"] else "silent + captions")
+    )
+    print("\n" + "=" * 74)
+    print("  VIDEO GENERATOR")
+    print("=" * 74)
+    print(
+        f"  preset    : {config.preset}  "
+        f"({config.resolution[0]}x{config.resolution[1]} @ {config.fps}fps)"
+    )
+    print(f"  visuals   : {visuals}")
+    print(f"  narration : {narration}")
+    print(f"  scripts   : {config.scripts_dir}/")
+    print("=" * 74)
+
+    with FreeTextToVideoGenerator(
+        config, progress=lambda pct, msg: print(f"  [{pct:5.1f}%] {msg}", flush=True)
+    ) as generator:
+        interactive = _is_interactive() and not assume_yes
+        existing = generator.store.list_scripts()
+        if not story and existing and interactive:
+            print(
+                f"\n{len(existing)} script(s) already in {config.scripts_dir}/. "
+                "Enter an id to re-render one, or press Enter to write a new story."
+            )
+            for script in existing[:8]:
+                print(f"  · {script.id}  [{script.status}]  {script.title} ({script.variant})")
+            choice = _ask("\nScript id (or Enter for new):")
+            if choice:
+                try:
+                    return _confirm_and_render(generator, generator.store.load(choice), assume_yes)
+                except FileNotFoundError:
+                    print(f"  ! no script '{choice}', writing a new story instead")
+
+        if not story and interactive:
+            story = _read_story()
+        if not story:
+            print("No story given; nothing to do.")
+            return None
+
+        while True:
+            print("\nGenerating candidate scripts…")
+            scripts = generator.propose_scripts(story)
+            _print_candidates(scripts)
+            if not interactive:
+                chosen = scripts[0]
+                print(f"Non-interactive: accepting [1] {chosen.variant}")
+                break
+            answer = _ask(
+                f"Accept which script? 1-{len(scripts)}, 'v N' to view in full, "
+                "'r' to regenerate:",
+                default="1",
+            ).lower()
+            if answer.startswith("v"):
+                parts = answer.split()
+                index = int(parts[1]) - 1 if len(parts) > 1 and parts[1].isdigit() else 0
+                if 0 <= index < len(scripts):
+                    print("\n" + "=" * 74)
+                    print(scripts[index].to_markdown())
+                    print("=" * 74)
+                continue
+            if answer == "r":
+                continue
+            if answer.isdigit() and 1 <= int(answer) <= len(scripts):
+                chosen = scripts[int(answer) - 1]
+                break
+            print("  ! not a valid choice")
+
+        generator.accept_script(chosen)
+        print(f"\n✓ Accepted: {chosen.variant} → {generator.store.path_for(chosen.id)}")
+        return _confirm_and_render(generator, chosen, assume_yes)
+
+
+def _confirm_and_render(
+    generator: FreeTextToVideoGenerator, script: VideoScript, assume_yes: bool
+) -> Optional[Path]:
+    name = _ask("Output filename:", default=f"{script.id}.mp4", assume_yes=assume_yes)
+    output = generator.config.output_dir / name
+
+    print(f"\n  {len(script.scenes)} scenes · ~{script.estimated_duration:.0f}s of video")
+    print(f"  estimated render time: {_estimate_render_time(generator, script)}")
+    if not assume_yes and _is_interactive():
+        if _ask("Render now? [Y/n]", default="y").lower().startswith("n"):
+            print("Cancelled. The script is saved and can be rendered later with --render.")
+            return None
+
+    started = time.time()
+    path = generator.render(script, output)
+    print(f"\n✓ {path}  ({time.time() - started:.1f}s)")
+    print(f"  script + render log: {generator.store.path_for(script.id)}")
+    return path
+
+
+def _estimate_render_time(generator: FreeTextToVideoGenerator, script: VideoScript) -> str:
+    if generator.image_pipe is None:
+        return f"under a minute ({len(script.scenes)} procedural scenes)"
+    steps = int(generator.config.preset_data["steps"])  # type: ignore[arg-type]
+    per_image = {"cuda": 0.6, "mps": 3.0, "cpu": 11.0}.get(generator.device, 11.0) * steps
+    total = per_image * len(script.scenes) + script.estimated_duration * 0.8
+    return f"~{total / 60:.1f} min ({per_image:.0f}s/image on {generator.device})"
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="video_generator",
+        description="Turn a short story into a narrated video.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            examples:
+              python video_generator.py                     interactive wizard
+              python video_generator.py --self-test         offline smoke test
+              python video_generator.py --story-file s.txt --yes --preset draft
+              python video_generator.py --list              show saved scripts
+              python video_generator.py --render <id>       re-render a saved script
+            """
+        ),
+    )
+    parser.add_argument("--preset", choices=sorted(PRESETS), default=DEFAULT_PRESET)
+    parser.add_argument("--story", help="story text passed inline")
+    parser.add_argument("--story-file", type=Path, help="read the story from a file")
+    parser.add_argument("--output", type=Path, help="output MP4 path")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--variant", choices=sorted(VARIANTS), help="skip the accept step")
+    parser.add_argument("--render", metavar="ID", help="render an existing saved script")
+    parser.add_argument("--list", action="store_true", help="list saved scripts and exit")
+    parser.add_argument("--self-test", action="store_true", help="offline end-to-end check")
+    parser.add_argument("--no-music", action="store_true")
+    parser.add_argument("--no-overlays", action="store_true", help="disable burned-in captions")
+    parser.add_argument("--llm", action="store_true", help="enrich prompts with a local LLM")
+    parser.add_argument("--yes", "-y", action="store_true", help="accept all defaults")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    return parser
+
+
+def _console_progress(pct: float, message: str) -> None:
+    print(f"  [{pct:5.1f}%] {message}", flush=True)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    config = GenerationConfig(
+        preset=args.preset,
+        seed=args.seed,
+        music=not args.no_music,
+        overlays=not args.no_overlays,
+        use_llm=args.llm,
+    )
+
+    if args.list:
+        for script in ScriptStore(config.scripts_dir).list_scripts():
+            print(
+                f"{script.id}  [{script.status:9}] {script.variant:12} "
+                f"{len(script.scenes)} scenes  {script.title}"
+            )
+        return 0
+
+    if args.self_test:
+        with FreeTextToVideoGenerator(config, progress=_console_progress) as generator:
+            path = generator.self_test(args.output)
+        print(f"\nSelf-test OK: {path}")
+        return 0
+
+    if args.render:
+        with FreeTextToVideoGenerator(config, progress=_console_progress) as generator:
+            _confirm_and_render(generator, generator.store.load(args.render), args.yes)
+        return 0
+
+    story = args.story_file.read_text(encoding="utf-8") if args.story_file else (args.story or "")
+
+    if args.variant and story:
+        with FreeTextToVideoGenerator(config, progress=_console_progress) as generator:
+            _, path = generator.generate_from_story(story, args.variant, args.output)
+        print(f"\n✓ {path}")
+        return 0
+
+    run_wizard(config, story=story, assume_yes=args.yes)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

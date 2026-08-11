@@ -1,0 +1,23 @@
+# OPTIONAL model stack. Install on top of requirements.txt to enable
+# Stable-Diffusion visuals, neural TTS, and LLM script enrichment.
+#
+#   pip install -r requirements.txt -r requirements-ml.txt
+#
+# Without these the generator still produces a complete video, using
+# procedurally rendered scene cards and a formant-synth narrator.
+#
+# PLATFORM NOTE: PyTorch publishes macOS x86_64 wheels only up to torch 2.2.2
+# (cp312). On an Intel Mac you therefore need Python <= 3.12 for this file to
+# resolve. Apple Silicon, Linux and Windows are unaffected.
+#
+# NVIDIA users wanting CUDA should install torch first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+-r requirements.txt
+
+torch>=2.2
+transformers>=4.44
+diffusers>=0.31
+accelerate>=0.30
+huggingface-hub>=0.24
+safetensors>=0.4
