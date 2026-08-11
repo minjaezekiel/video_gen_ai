@@ -21,3 +21,9 @@ video_scripts/self-test.md
 
 # os
 .DS_Store
+
+# character reference art is user-supplied; the .md records are tracked
+characters/*.png
+characters/*.jpg
+characters/*.jpeg
+verify_out/

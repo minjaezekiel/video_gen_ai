@@ -1,111 +1,119 @@
 # Roadmap
 
-Status of the rebuild, and what comes next. Rationale for everything in
-Phases 0–5 is in [decision.md](decision.md).
+Where this has got to, and what is next. Rationale for everything below is in
+[decision.md](decision.md); current build state is in
+[IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ---
 
-## Phase 0 — Installable ✅
+## v1 — Slideshow engine ✅ complete
 
-- [x] Drop the `+cu118` pins that made `pip install` fail on every non-NVIDIA machine
-- [x] Split the model stack into `requirements-ml.txt`; core install needs no torch
-- [x] Migrate moviepy 1.x → 2.x (`moviepy.editor` removed, `.set_*` → `.with_*`, effects API)
-- [x] Bundle ffmpeg via `imageio-ffmpeg` — no system ffmpeg required
-- [x] `certifi` + `SSL_CERT_FILE` so HTTPS works on the macOS python.org build
-- [x] Device selection `cuda → mps → cpu`, fp16 gated to CUDA
-- [x] Verified: clean venv install succeeds on Intel Mac / Python 3.13
+A project that could not run at all became a fast, offline, CPU-friendly
+narrated-video generator.
 
-## Phase 1 — Pipeline correctness ✅
+- [x] **Installable**: dropped the `+cu118` pins that made `pip install` fail on
+      every non-NVIDIA machine; split the model stack into `requirements-ml.txt`;
+      migrated moviepy 1.x → 2.x; bundled ffmpeg via `imageio-ffmpeg`; fixed the
+      missing macOS root certificates with `certifi`
+- [x] **Correct**: 16 bugs audited and fixed — output written into the directory
+      cleanup deletes, every scene narrating simultaneously, narration always
+      parsed as empty, the TTS literally speaking the words "female voice",
+      A/V drift, `PYTHONHASHSEED`-dependent seeds, a cache that had never once
+      been a cache ([full table](decision.md))
+- [x] **Fast**: one diffusion call per scene instead of five; Ken Burns motion
+      instead of pixel interpolation; the whole video assembled as a single
+      `VideoClip` — **42.8 s → 18.5 s**
+- [x] **Durable**: markdown script store with render history and a regenerated index
+- [x] **Offline**: every stage degrades instead of failing; `--self-test` needs
+      no network
 
-- [x] Write output to `output/`, not into the temp dir that cleanup deletes
-- [x] Sequence narration per scene instead of starting every clip at t=0
-- [x] Make measured audio duration the source of truth for scene length
-- [x] Fix scene parsing (narration was always empty)
-- [x] Fix TTS: real checkpoint, real sample rate, no spoken `[female voice]` tag
-- [x] Idempotent recursive cleanup; drop the `__del__`/`atexit` double-teardown
-- [x] CRF-only encoding (was fighting a contradictory `bitrate=`)
-- [x] Model-load failures log loudly and degrade visibly instead of `except: pass` → black frames
-- [x] Full audit table — 16 bugs — in [decision.md §1.1](decision.md)
+## v2 — Film engine ✅ complete
 
-## Phase 2 — Speed ✅
+From "narrated slideshow" to "a cast, a shot list and a voice each".
 
-- [x] One diffusion call per scene; delete keyframe generation + pixel interpolation
-- [x] Ken Burns crop/zoom animation with smoothstep easing
-- [x] Stop building one `ImageClip` per frame
-- [x] Assemble the whole video as a **single** `VideoClip` with hand-rolled crossfades
-      (moviepy's `method="compose"` cost 4×) — **42.8 s → 18.5 s**
-- [x] SD-Turbo preset table with CFG disabled on turbo checkpoints
-- [x] Per-call generator seeding; `md5` seeds instead of `PYTHONHASHSEED`-dependent `hash()`
-- [x] Persistent image cache outside the temp dir
-- [x] Remove the thread pool around the (not thread-safe) diffusion pipeline
-
-## Phase 3 — Script store ✅
-
-- [x] `video_scripts/<id>.md`, YAML frontmatter + markdown scenes, round-trippable
-- [x] `ScriptStore.save/load/list/accept/record_render`
-- [x] Lifecycle `candidate → accepted | rejected → rendered`
-- [x] Render history appended with measured timings and active backends
-- [x] `INDEX.md` regenerated on every save
-- [x] Re-render saved scripts (`--render <id>`); hand-edits respected
-
-## Phase 4 — Story → candidates → accept → render ✅
-
-- [x] Deterministic beat segmentation backbone (instant, offline, always well-formed)
-- [x] Three candidate treatments varying pacing, not sampling temperature
-- [x] Optional LLM prompt enrichment, strictly off the critical path
-- [x] Interactive wizard with the accept step; `v N` to view a candidate in full, `r` to regenerate
-- [x] Non-interactive/TTY-safe prompts (`--yes`) so the same paths work in CI
-
-## Phase 5 — Tests & docs ✅
-
-- [x] `test.py` → 63 pytest tests, fully offline, 4.8 s
-- [x] `--self-test`: full pipeline, zero downloads, primary regression gate
-- [x] Regression tests for each fixed bug class (parser, cleanup, cache, A/V drift, seeds)
-- [x] `decision.md`, `roadmap.md`, rewritten `README.md`, `.gitignore`
+- [x] **Screenplay model**: `Production → Scene → Shot → Line` plus `Character`
+      and `VoiceProfile`; markdown round-trip is byte-stable
+- [x] **Character registry**: `characters/<id>.md` beside reference art; reusable
+      across productions; fills gaps but never overrides a script
+- [x] **Interview**: 8 clarifying questions, every default inferred from the
+      prompt (format, style, aspect, length, audience, tone, cast)
+- [x] **Screenwriter**: screenplays, prose stories and briefs; dialogue
+      attribution through pronouns; brand names kept out of the cast; reported
+      speech lifted into real dialogue; one speaker per shot
+- [x] **Casting**: 26 castable system voices discovered; traits from description
+      then a name table; deterministic, distinct, order-independent, never
+      overrides a hand-set voice
+- [x] **Per-character speech**: rate and pitch shaping so each role is a
+      different performer
+- [x] **Score + ducking**: per-scene mood with crossfaded cues; bed drops −11 dB
+      under dialogue instead of sitting at a fixed level
+- [x] **Visual backend seam**: one `VisualBackend` Protocol, a registry that
+      degrades per capability, `ProceduralBackend` (always available) and
+      `MockBackend` (claims everything, for testing what cannot run here)
+- [x] **Render**: speaker-labelled captions in each character's colour, camera
+      moves driven by the shot list, motion-clip playback, single-clip timeline
+- [x] **Formats and aspects**: ad / short / educational / explainer × 16:9, 9:16,
+      1:1, 4:5, 21:9 — the preset sets the short side, so 9:16 is 720×1280
+- [x] **CLI**: `create`, `--render`, `--list`, `--characters`, `--cast`,
+      `--doctor`, `--self-test`
+- [x] **124 tests**, all offline, including mock-driven identity and motion paths
 
 ---
 
 ## Not done — known gaps
 
-**Measure SD-Turbo on real hardware.** The preset timings in
-[decision.md §2.4](decision.md) are estimates. PyTorch has no macOS x86_64 wheel
-for Python 3.13, so the model path cannot run on this machine at all
-([§3.1](decision.md)). Verifying it needs Python ≤ 3.12 here, or any Linux /
-Apple Silicon / Windows box. The procedural path is fully measured.
+**Run `verify_backends.py` on real hardware.** Everything in
+`video_gen/visuals/diffusion.py` — SD stills, IP-Adapter identity, AnimateDiff
+motion — is **written but has never been executed**. torch has no macOS x86_64
+wheel past Python 3.12 and onnxruntime none for 3.13, so no neural code can run
+on the development machine at all. This is the single highest-value next step.
 
-**Tune `standard` after measuring.** If a 5-scene `standard` render exceeds
-~5 minutes on a typical CPU, drop the image size to 448 px and re-measure.
+**LLM dialogue generation.** `--llm` currently only rewrites visual prompts. A
+brief ("a 20 second advert for X") can be structured and staged, and reported
+speech is lifted into lines, but the engine cannot *invent* ad copy. Writing
+dialogue is the one part of screenwriting that genuinely needs a model.
+
+**LoRA character training.** `DiffusionBackend.train_character` raises
+`NotImplementedError` on purpose — a training loop cannot be written blind
+against hardware that has never run it. The seam exists; `Character.lora` is
+already carried through the model, the store and `ShotRequest`.
 
 ---
 
-## Later
+## Next
 
-### Visual quality
-- **LCM / SDXL-Turbo** as an additional preset once base timings are measured.
-- **AnimateDiff or SVD** for genuine motion. Not viable on a 16 GB CPU host —
-  gate behind a `--preset motion` that requires CUDA and says so.
-- **img2img scene continuity**: seed each scene from the previous one at low
-  strength so a story keeps a consistent look. Cheap, and a large perceived win.
-- **Character consistency** via a fixed character description prefix plus a
-  locked seed per named character.
+### Visual fidelity
+- **Verify, then tune the presets.** Every SD timing in decision.md §2.4 is an
+  estimate. Measure, then adjust default resolution if `standard` is too slow.
+- **Character consistency across shots**: IP-Adapter is wired but unverified;
+  add InstantID/PhotoMaker as alternatives once there is hardware to compare on.
+- **img2img shot continuity**: seed each shot from the previous one at low
+  strength so a scene holds its look. Cheap, and a large perceived win.
+- **LTX-Video / Wan 2.x** as motion backends alongside AnimateDiff — both are
+  more consumer-GPU-friendly than SVD.
+- **Style-tier checkpoints**: an anime checkpoint for `2d` and a photoreal one
+  for `realistic`, rather than prompt conditioning alone.
+
+### Characters
+- **Upload → character**: `--import-character name image.png` is half-built
+  (`CharacterStore.import_reference` works); wire it into the CLI and the
+  interview so a user can cast their own art.
+- **Character sheets**: generate a reference turnaround once per character and
+  condition every shot on it, rather than on a single photo.
+- **Lip sync**: audio-driven mouth states for the procedural tier — a real
+  animation win that needs no model at all.
 
 ### Audio
-- **MusicGen-small** for real background music, cached per mood. ~2 GB, minutes
-  per clip on CPU — optional, off by default.
-- **Ducking**: drop the music bed a few dB under narration instead of using a
-  fixed low volume.
-- **Word-level timing** from the TTS to drive per-line caption timing.
+- **MusicGen-small** for generated score, cached per mood.
+- **Word-level timing** from the TTS to drive per-word caption highlighting.
+- **Sound effects** keyed off shot actions.
 
 ### Output
-- **Subtitle sidecar** (`.srt`) alongside the burned-in captions — scene
-  timings are already computed.
-- **Aspect presets**: 9:16 and 1:1 for social, with the caption box and Ken
-  Burns framing adapted per aspect.
-- **Batch mode**: render every `accepted` script in `video_scripts/`.
-- **Resume**: skip scenes whose cached image and audio are both current.
+- **`.srt` sidecar** — timings are already computed, this is nearly free.
+- **Batch render** every `accepted` production.
+- **Resume**: skip shots whose cached image and audio are both current.
 
 ### Workflow
-- **Style references**: let the wizard seed a new script's look from a past
-  accepted script — the store already keeps everything needed.
-- **`--edit`**: open the accepted script in `$EDITOR` before rendering.
-- **Web UI**, if the CLI ever stops being enough.
+- **Style references**: seed a new production's look from a past accepted one.
+- **`--edit`**: open the screenplay in `$EDITOR` before rendering.
+- **Web UI**, if the CLI stops being enough.

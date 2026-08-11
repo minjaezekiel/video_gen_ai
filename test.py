@@ -1,64 +1,126 @@
-"""Test suite for the video generator.
+"""Test suite for the film generator.
 
-Every test here runs offline with no model downloads, so the whole suite is a
-usable pre-commit gate.  The one end-to-end render is marked ``slow``:
+Everything here runs offline with no model downloads, so the whole suite works
+as a pre-commit gate. The single end-to-end render is marked ``slow``:
 
-    pytest test.py                  # fast unit tests only
-    pytest test.py -m slow          # the full render
-    pytest test.py -m ''            # everything
+    pytest test.py              # fast unit tests only
+    pytest test.py -m slow      # the full render
+    pytest test.py -m ''        # everything
+
+`MockBackend` stands in for the diffusion stack, which cannot run on this
+machine at all. That is what lets the identity, motion and capability-degrade
+paths be tested here despite no model ever being loaded.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from video_generator import (
-    CROSSFADE_SECONDS,
-    MIN_SCENE_SECONDS,
+from video_gen import (
+    ASPECTS,
+    FORMATS,
     PRESETS,
-    VARIANTS,
-    FreeTextToVideoGenerator,
+    STYLE_TIERS,
+    Character,
+    CharacterStore,
+    FilmRenderer,
     GenerationConfig,
+    Interview,
+    Line,
+    Production,
+    ProductionStore,
     Scene,
-    ScriptStore,
-    StoryScripter,
-    VideoScript,
-    _parse_scenes,
-    _slugify,
-    _split_frontmatter,
-    _stable_seed,
-    build_parser,
-    capability_report,
+    Screenwriter,
+    Shot,
+    SpeechSynthesizer,
+    StoryMeta,
+    VoiceProfile,
+    cast_production,
+    infer_meta,
 )
+from video_gen.casting import SystemVoice, cast_voice, infer_traits
+from video_gen.config import CROSSFADE_SECONDS, MIN_SHOT_SECONDS
+from video_gen.model import NARRATOR, character_key, parse_scenes, slugify, stable_seed
+from video_gen.music import MOODS, duck, mood_for, render_bed, score_timeline
+from video_gen.speech import apply_pitch, apply_rate, normalize
+from video_gen.visuals import (
+    IDENTITY,
+    MOTION,
+    STILL,
+    TRAIN,
+    BackendRegistry,
+    CharacterRef,
+    MockBackend,
+    ProceduralBackend,
+    ShotRequest,
+    character_palette,
+)
+from video_gen.visuals.base import ShotVisual
 
-STORY = (
-    "The lighthouse keeper had not seen a ship in forty years. "
-    "Every night he lit the lamp anyway, and every morning he wrote the date in "
-    "his ledger. On the fourth of October a sail appeared on the horizon. "
-    "He did not trust his eyes, so he waited until noon. "
-    "The ship was still there, and it was coming closer."
+SCRIPT = """INT. CONTROL ROOM - NIGHT
+
+Banks of monitors glow in the dark.
+
+MAYA: The signal is back. Same rhythm as last night.
+JONAS (wary): Then it was never noise.
+MAYA: We are out of time.
+
+EXT. CAR PARK - DAWN
+
+Rain falls on empty tarmac.
+
+JONAS: Drive carefully.
+"""
+
+PROSE = (
+    "Maya had run the night shift for three years. The signal came at 3am, a rhythm "
+    'buried in the static. "We are out of time," she said, watching the trace climb. '
+    'Jonas leaned over the console and frowned. "Then we go tonight," Jonas replied. '
+    "Outside, the rain kept falling on the empty car park."
 )
 
 
 @pytest.fixture
 def config(tmp_path) -> GenerationConfig:
-    """A config fully sandboxed into tmp_path, at a cheap resolution."""
+    """Config fully sandboxed into tmp_path, at a cheap resolution."""
     return GenerationConfig(
         preset="draft",
         resolution=(320, 180),
         fps=12,
         output_dir=tmp_path / "output",
         scripts_dir=tmp_path / "video_scripts",
+        characters_dir=tmp_path / "characters",
         cache_dir=tmp_path / ".cache",
     )
 
 
 @pytest.fixture
-def generator(config):
-    with FreeTextToVideoGenerator(config) as gen:
-        yield gen
+def renderer(config):
+    registry = BackendRegistry([ProceduralBackend(config)])
+    with FilmRenderer(config, registry=registry) as film:
+        yield film
+
+
+def sample_production() -> Production:
+    production = Production(id="t1", title="The Signal", logline="Two engineers hear something.")
+    production.add_character(
+        Character("Maya", role="engineer", description="A sharp woman. She runs the night shift.")
+    )
+    production.add_character(Character("Jonas", role="technician", description="An older man."))
+    scene = Scene(1, setting="Control room", time_of_day="night", mood="tense")
+    scene.shots = [
+        Shot(1, "establishing", ["Maya"], action="monitors glow", camera="push in",
+             visual="a dim control room", lines=[Line(NARRATOR, "It began at 3am.")], duration=4.0),
+        Shot(2, "close", ["Maya"], lines=[Line("Maya", "We're out of time.", "whispering")],
+             duration=3.2),
+        Shot(3, "medium", ["Jonas"], lines=[Line("Jonas", "Then we go tonight.")], duration=2.8),
+    ]
+    production.scenes = [scene]
+    return production
 
 
 # --------------------------------------------------------------------------- #
@@ -66,19 +128,29 @@ def generator(config):
 # --------------------------------------------------------------------------- #
 
 
-def test_preset_defaults_are_applied():
-    config = GenerationConfig(preset="standard")
-    assert config.resolution == (1280, 720)
-    assert config.fps == 24
+def test_resolution_derives_from_preset_and_aspect():
+    assert GenerationConfig(preset="standard", aspect="16:9").resolution == (1280, 720)
+    assert GenerationConfig(preset="standard", aspect="9:16").resolution == (720, 1280)
+    assert GenerationConfig(preset="standard", aspect="1:1").resolution == (720, 720)
 
 
-def test_unknown_preset_rejected():
-    with pytest.raises(ValueError, match="unknown preset"):
-        GenerationConfig(preset="ultra")
+def test_portrait_is_detected():
+    assert GenerationConfig(aspect="9:16").is_portrait
+    assert not GenerationConfig(aspect="16:9").is_portrait
 
 
-def test_odd_resolution_rejected():
-    # H.264 with yuv420p cannot encode odd dimensions; fail early, not in ffmpeg.
+@pytest.mark.parametrize("aspect", sorted(ASPECTS))
+@pytest.mark.parametrize("preset", sorted(PRESETS))
+def test_every_resolution_is_h264_encodable(preset, aspect):
+    # H.264 with yuv420p cannot encode odd dimensions.
+    width, height = GenerationConfig.resolution_for(preset, aspect)
+    assert width % 2 == 0 and height % 2 == 0
+
+
+def test_bad_config_values_are_rejected():
+    for kwargs in ({"preset": "ultra"}, {"aspect": "3:7"}, {"style": "claymation"}):
+        with pytest.raises(ValueError):
+            GenerationConfig(**kwargs)
     with pytest.raises(ValueError, match="even"):
         GenerationConfig(resolution=(641, 480))
 
@@ -95,512 +167,880 @@ def test_turbo_presets_disable_guidance(name):
         assert preset["guidance"] > 1.0
 
 
-def test_capability_report_keys():
-    assert set(capability_report()) >= {"torch", "diffusers", "transformers", "system_tts"}
+def test_every_style_and_format_is_complete():
+    for style in STYLE_TIERS.values():
+        assert style["prompt_suffix"] and style["label"]
+    for spec in FORMATS.values():
+        assert spec["target_seconds"] > 0 and spec["wpm"] > 0
 
 
 # --------------------------------------------------------------------------- #
-# Script parsing
+# Screenplay model and markdown
 # --------------------------------------------------------------------------- #
 
 
-def test_parse_well_formed_scenes():
-    body = (
-        "## Scene 1 — 4.0s\n\n"
-        "**Visual:** a lighthouse at dusk\n\n"
-        "**Narration:** He lit the lamp.\n\n"
-        "## Scene 2 — 2.5s\n\n"
-        "**Visual:** a sail on the horizon\n\n"
-        "**Narration:** Then he waited.\n"
+def test_production_markdown_round_trip():
+    original = sample_production()
+    original.cast[0].voice = VoiceProfile("system", "Samantha", 0.97, -1.2, "female")
+    restored = Production.from_markdown(original.to_markdown())
+
+    assert restored.title == original.title
+    assert [c.name for c in restored.cast] == ["Maya", "Jonas"]
+    assert restored.character("maya").voice.voice == "Samantha"
+    assert len(restored.shots) == 3
+    assert restored.shots[0].camera == "push in"
+    assert restored.shots[0].lines[0].is_narration
+    assert restored.shots[1].lines[0].delivery == "whispering"
+    assert restored.shots[1].lines[0].text == "We're out of time."
+    assert restored.shots[1].duration == pytest.approx(3.2, abs=0.06)
+    assert restored.scenes[0].time_of_day == "night"
+    assert restored.scenes[0].mood == "tense"
+    # Stable enough to re-save without churning the file.
+    assert restored.to_markdown() == original.to_markdown()
+
+
+def test_dialogue_and_named_fields_are_not_confused():
+    """`**With:**` is metadata; `**MAYA:**` is speech. Both are bold-colon."""
+    shots = parse_scenes(
+        "## Scene 1 — Lab\n\n### Shot 1 — close — 3.0s\n\n"
+        "**With:** Maya, Jonas\n**Camera:** push in\n**Action:** she turns\n"
+        "**Visual:** a lab\n**MAYA (quiet):** Look at this.\n"
+    )[0].shots
+    shot = shots[0]
+    assert shot.subjects == ["Maya", "Jonas"]
+    assert shot.camera == "push in"
+    assert shot.action == "she turns"
+    assert [(l.character, l.delivery, l.text) for l in shot.lines] == [
+        ("MAYA", "quiet", "Look at this.")
+    ]
+
+
+def test_parsing_tolerates_junk():
+    assert parse_scenes("") == []
+    assert parse_scenes("just prose, no headings") == []
+    # A malformed shot is skipped without taking its scene down.
+    scenes = parse_scenes(
+        "## Scene 1 — Lab\n\n### Shot 1\n\nnothing useful\n\n### Shot 2\n\n**Action:** fine\n"
     )
-    scenes = _parse_scenes(body)
-    assert len(scenes) == 2
-    assert scenes[0].visual == "a lighthouse at dusk"
-    # Regression: the original regex always captured an empty narration.
-    assert scenes[0].narration == "He lit the lamp."
-    assert scenes[0].duration == 4.0
-    assert scenes[1].narration == "Then he waited."
+    assert len(scenes) == 1 and [s.index for s in scenes[0].shots] == [2]
 
 
-def test_parse_tolerates_missing_fields_and_junk():
-    body = (
-        "## Scene 1\n\n**Visual:** only a visual\n\n"
-        "## Scene 2\n\nnothing useful here\n\n"
-        "## Scene 3\n\n**Narration:** only narration\n"
-    )
-    scenes = _parse_scenes(body)
-    # The empty block is dropped; the half-filled ones survive.
-    assert [s.index for s in scenes] == [1, 3]
-    assert scenes[0].narration == ""
-    assert scenes[0].duration == MIN_SCENE_SECONDS
+def test_character_key_is_case_and_space_insensitive():
+    assert character_key(" maya  smith ") == character_key("MAYA SMITH")
+    production = sample_production()
+    assert production.character("MAYA") is production.character("maya")
 
 
-def test_parse_empty_input():
-    assert _parse_scenes("") == []
-    assert _parse_scenes("just some prose with no headings") == []
+def test_add_character_is_idempotent():
+    production = sample_production()
+    before = len(production.cast)
+    production.add_character(Character("MAYA"))
+    assert len(production.cast) == before
 
 
-def test_split_frontmatter_handles_malformed_yaml():
-    front, body = _split_frontmatter("---\n: : not: yaml:\n---\n\nbody text\n")
-    assert front == {}
-    assert "body text" in body
-
-
-def test_split_frontmatter_absent():
-    front, body = _split_frontmatter("# just markdown\n")
-    assert front == {}
-    assert body == "# just markdown\n"
-
-
-# --------------------------------------------------------------------------- #
-# Script store round-trip
-# --------------------------------------------------------------------------- #
-
-
-def test_script_markdown_round_trip(tmp_path):
-    original = VideoScript(
-        id="2026-08-10-test-abcd",
-        title="A Story: with punctuation & symbols",
-        variant="Fast-cut",
-        scenes=[
-            Scene(1, "a lighthouse, wide shot", "He lit the lamp.", 4.25),
-            Scene(2, "a sail, close up", "Then he waited.", 2.5, overlay="LATER"),
-        ],
-        source_story=STORY,
-        config={"preset": "draft", "seed": 7},
-    )
-    store = ScriptStore(tmp_path / "scripts")
-    store.save(original)
-    loaded = store.load(original.id)
-
-    assert loaded.id == original.id
-    assert loaded.title == original.title
-    assert loaded.variant == original.variant
-    assert loaded.status == original.status
-    assert loaded.source_story == original.source_story
-    assert loaded.config == original.config
-    assert len(loaded.scenes) == 2
-    assert loaded.scenes[0].narration == "He lit the lamp."
-    assert loaded.scenes[0].duration == pytest.approx(4.25, abs=0.06)
-    assert loaded.scenes[1].overlay == "LATER"
-
-
-def test_index_is_regenerated_on_save(tmp_path):
-    store = ScriptStore(tmp_path / "scripts")
-    store.save(VideoScript("id-1", "First", "Cinematic", [Scene(1, "v", "n")]))
-    index = (store.root / "INDEX.md").read_text()
-    assert "id-1" in index and "First" in index
-
-
-def test_index_is_not_loaded_as_a_script(tmp_path):
-    store = ScriptStore(tmp_path / "scripts")
-    store.save(VideoScript("id-1", "First", "Cinematic", [Scene(1, "v", "n")]))
-    assert [s.id for s in store.list_scripts()] == ["id-1"]
-
-
-def test_unreadable_script_does_not_hide_the_others(tmp_path):
-    store = ScriptStore(tmp_path / "scripts")
-    store.save(VideoScript("good", "Good", "Cinematic", [Scene(1, "v", "n")]))
-    (store.root / "broken.md").write_text("---\n[unclosed\n")
-    assert "good" in [s.id for s in store.list_scripts()]
-
-
-def test_accept_demotes_sibling_candidates(tmp_path):
-    store = ScriptStore(tmp_path / "scripts")
-    batch = {"batch": "B1"}
-    a = VideoScript("a", "A", "Cinematic", [Scene(1, "v", "n")], config=dict(batch))
-    b = VideoScript("b", "B", "Fast-cut", [Scene(1, "v", "n")], config=dict(batch))
-    c = VideoScript("c", "C", "Documentary", [Scene(1, "v", "n")], config={"batch": "B2"})
-    for script in (a, b, c):
-        store.save(script)
-
-    store.accept(a)
-    assert store.load("a").status == "accepted"
-    assert store.load("b").status == "rejected"
-    # A different batch is untouched.
-    assert store.load("c").status == "candidate"
-
-
-def test_record_render_appends_and_flips_status(tmp_path):
-    store = ScriptStore(tmp_path / "scripts")
-    script = VideoScript("r", "R", "Cinematic", [Scene(1, "v", "n")])
-    store.save(script)
-    store.record_render(script, {"output": "one.mp4", "elapsed_s": 1.0})
-    store.record_render(script, {"output": "two.mp4", "elapsed_s": 2.0})
-
-    loaded = store.load("r")
-    assert loaded.status == "rendered"
-    assert [r["output"] for r in loaded.renders] == ["one.mp4", "two.mp4"]
-
-
-def test_load_missing_script_raises(tmp_path):
-    with pytest.raises(FileNotFoundError):
-        ScriptStore(tmp_path / "scripts").load("nope")
-
-
-# --------------------------------------------------------------------------- #
-# Story -> scenes
-# --------------------------------------------------------------------------- #
-
-
-def test_sentence_split():
-    assert len(StoryScripter.split_sentences(STORY)) == 5
-
-
-def test_long_run_on_sentence_is_broken_up():
-    run_on = " ".join(["word"] * 60) + ", and " + " ".join(["more"] * 20) + "."
-    assert len(StoryScripter.split_sentences(run_on)) >= 2
-
-
-def test_beat_grouping_preserves_every_sentence():
-    sentences = [f"Sentence {i}." for i in range(9)]
-    beats = StoryScripter.group_into_beats(sentences, 4)
-    assert len(beats) == 4
-    # Nothing dropped, nothing reordered.
-    assert " ".join(beats) == " ".join(sentences)
-
-
-def test_beat_grouping_clamps_to_sentence_count():
-    assert len(StoryScripter.group_into_beats(["One.", "Two."], 8)) == 2
-
-
-def test_candidates_differ_in_pacing(config):
-    scripts = StoryScripter(config).generate_candidates(STORY)
-    assert len(scripts) == len(VARIANTS)
-    assert {s.variant for s in scripts} == set(VARIANTS)
-    # The whole point of the accept step is that the options are distinguishable.
-    assert len({len(s.scenes) for s in scripts}) > 1
-    for script in scripts:
-        assert script.scenes, "every candidate must have scenes"
-        assert all(s.narration for s in script.scenes)
-        assert all(s.visual for s in script.scenes)
-        assert all(s.duration >= MIN_SCENE_SECONDS for s in script.scenes)
-
-
-def test_candidate_ids_are_unique(config):
-    scripts = StoryScripter(config).generate_candidates(STORY)
-    assert len({s.id for s in scripts}) == len(scripts)
-
-
-def test_candidates_share_a_batch(config):
-    scripts = StoryScripter(config).generate_candidates(STORY)
-    assert len({s.config["batch"] for s in scripts}) == 1
-
-
-def test_empty_story_rejected(config):
-    with pytest.raises(ValueError, match="empty"):
-        StoryScripter(config).generate_candidates("   \n  ")
-
-
-def test_keywords_drop_stopwords_and_keep_subjects():
-    words = StoryScripter.keywords("The keeper had not seen a ship in forty years.")
-    assert "keeper" in words and "ship" in words
-    assert not {"the", "had", "not", "in"} & set(words)
-
-
-def test_duration_scales_with_word_count():
-    short = StoryScripter.estimate_duration("Two words.", 150)
-    long = StoryScripter.estimate_duration(" ".join(["word"] * 60), 150)
-    assert MIN_SCENE_SECONDS <= short < long
-
-
-def test_duration_is_clamped_both_ways():
-    assert StoryScripter.estimate_duration("Hi.", 150) == MIN_SCENE_SECONDS
-    assert StoryScripter.estimate_duration(" ".join(["w"] * 5000), 150) <= 12.0
-
-
-# --------------------------------------------------------------------------- #
-# Determinism
-# --------------------------------------------------------------------------- #
+def test_speaking_cast_excludes_silent_members():
+    production = sample_production()
+    production.add_character(Character("Extra"))
+    assert [c.name for c in production.speaking_cast] == ["Maya", "Jonas"]
 
 
 def test_slugify_truncates_on_a_word_boundary():
-    slug = _slugify("A cartographer spent her life drawing coastlines")
-    assert slug == "a-cartographer-spent-her-life"
-    assert not slug.endswith("-")
-
-
-def test_slugify_handles_degenerate_input():
-    assert _slugify("") == "untitled"
-    assert _slugify("!!!") == "untitled"
-    # A single over-long word still has to yield something usable.
-    assert len(_slugify("x" * 100)) == 32
-
-
-def test_title_comes_from_the_story_not_keyword_soup():
-    title = StoryScripter._derive_title(
-        "A cartographer spent her life drawing coastlines she had never walked. "
-        "Each map was a guess."
-    )
-    assert title.startswith("A cartographer spent her life")
+    assert slugify("A cartographer spent her life drawing coastlines") == "a-cartographer-spent-her-life"
+    assert slugify("") == "untitled" and slugify("!!!") == "untitled"
+    assert len(slugify("x" * 100)) == 32
 
 
 def test_stable_seed_is_process_independent():
-    # Regression: the original used hash(), which varies with PYTHONHASHSEED.
-    assert _stable_seed("a lighthouse") == _stable_seed("a lighthouse")
-    assert _stable_seed("a lighthouse") != _stable_seed("a sail")
-    assert _stable_seed("x", salt=1) != _stable_seed("x", salt=2)
+    # Regression: hash() varies with PYTHONHASHSEED between runs.
+    assert stable_seed("a lighthouse") == stable_seed("a lighthouse")
+    assert stable_seed("a lighthouse") != stable_seed("a sail")
+    assert stable_seed("x", 1) != stable_seed("x", 2)
 
 
-def test_scene_card_is_deterministic_for_a_seed():
-    a = FreeTextToVideoGenerator.render_scene_card("a lighthouse", 42, (64, 64))
-    b = FreeTextToVideoGenerator.render_scene_card("a lighthouse", 42, (64, 64))
-    c = FreeTextToVideoGenerator.render_scene_card("a lighthouse", 43, (64, 64))
-    assert np.array_equal(np.asarray(a), np.asarray(b))
-    assert not np.array_equal(np.asarray(a), np.asarray(c))
+# --------------------------------------------------------------------------- #
+# Stores
+# --------------------------------------------------------------------------- #
 
 
-def test_image_cache_is_reused(generator):
-    first = generator.generate_image("a quiet harbour", seed_salt=1)
-    cached = list(generator.image_cache_dir.glob("*.png"))
-    assert len(cached) == 1
-    second = generator.generate_image("a quiet harbour", seed_salt=1)
+def test_production_store_round_trip_and_index(config):
+    store = ProductionStore(config.scripts_dir)
+    store.save(sample_production())
+    assert store.load("t1").title == "The Signal"
+    assert "t1" in (store.root / "INDEX.md").read_text()
+    assert [p.id for p in store.list_productions()] == ["t1"]  # INDEX.md is not a production
+
+
+def test_unreadable_file_does_not_hide_the_others(config):
+    store = ProductionStore(config.scripts_dir)
+    store.save(sample_production())
+    (store.root / "broken.md").write_text("---\n[unclosed\n")
+    assert "t1" in [p.id for p in store.list_productions()]
+
+
+def test_accept_demotes_batch_siblings(config):
+    store = ProductionStore(config.scripts_dir)
+    keep, drop, other = sample_production(), sample_production(), sample_production()
+    keep.id, drop.id, other.id = "a", "b", "c"
+    keep.config = drop.config = {"batch": "B1"}
+    other.config = {"batch": "B2"}
+    for production in (keep, drop, other):
+        store.save(production)
+
+    store.accept(keep)
+    assert store.load("a").status == "accepted"
+    assert store.load("b").status == "rejected"
+    assert store.load("c").status == "draft"  # a different batch is untouched
+
+
+def test_record_render_appends(config):
+    store = ProductionStore(config.scripts_dir)
+    production = sample_production()
+    store.save(production)
+    store.record_render(production, {"output": "one.mp4"})
+    store.record_render(production, {"output": "two.mp4"})
+    restored = store.load("t1")
+    assert restored.status == "rendered"
+    assert [r["output"] for r in restored.renders] == ["one.mp4", "two.mp4"]
+
+
+def test_missing_records_raise(config):
+    with pytest.raises(FileNotFoundError):
+        ProductionStore(config.scripts_dir).load("nope")
+    with pytest.raises(FileNotFoundError):
+        CharacterStore(config.characters_dir).load("nobody")
+
+
+def test_character_store_round_trip(config):
+    store = CharacterStore(config.characters_dir)
+    maya = Character("Maya", "engineer", "Sharp.", "red hair", VoiceProfile("system", "Kathy", 1.02, -2.0))
+    store.save(maya)
+    restored = store.load(maya.id)
+    assert restored.name == "Maya" and restored.appearance == "red hair"
+    assert restored.voice.voice == "Kathy" and restored.voice.pitch == pytest.approx(-2.0)
+    assert store.find("MAYA") is not None
+
+
+def test_stored_character_fills_gaps_but_never_overrides(config):
+    """A production that states its own details keeps them."""
+    store = CharacterStore(config.characters_dir)
+    store.save(Character("Maya", "engineer", "Stored description.", "stored hair",
+                         VoiceProfile("system", "Kathy")))
+    production = Production(id="p", title="T")
+    production.add_character(Character("Maya", appearance="scripted hair"))
+    store.merge_into(production)
+
+    member = production.character("Maya")
+    assert member.appearance == "scripted hair"  # the script wins
+    assert member.description == "Stored description."  # the gap is filled
+    assert member.voice.voice == "Kathy"
+
+
+def test_import_reference_copies_the_image(config, tmp_path):
+    source = tmp_path / "face.png"
+    Image.new("RGB", (16, 16), (200, 40, 40)).save(source)
+    store = CharacterStore(config.characters_dir)
+    member = store.import_reference(Character("Maya"), source)
+    assert member.reference_image and Path(member.reference_image).exists()
+    assert Path(member.reference_image).parent == config.characters_dir
+    assert store.load("maya").reference_image == member.reference_image
+
+
+# --------------------------------------------------------------------------- #
+# Screenwriting
+# --------------------------------------------------------------------------- #
+
+
+def test_script_input_is_detected_and_prose_is_not():
+    assert Screenwriter.looks_like_script(SCRIPT)
+    assert not Screenwriter.looks_like_script(PROSE)
+
+
+def test_script_parses_into_scenes_shots_and_cast():
+    production = Screenwriter().write(SCRIPT, StoryMeta(format="short"))
+    assert [c.name for c in production.cast] == ["Maya", "Jonas"]
+    assert len(production.scenes) == 2
+    assert production.scenes[0].setting == "Control Room"
+    # The slugline is the authority on time of day, not the prose below it.
+    assert production.scenes[0].time_of_day == "night"
+    assert production.scenes[1].time_of_day == "dawn"
+    assert any(l.delivery == "wary" for s in production.shots for l in s.lines)
+
+
+def test_logline_skips_screenplay_furniture():
+    # Regression: naive splitting made the logline "INT.".
+    assert Screenwriter().write(SCRIPT, StoryMeta()).logline.startswith("Banks of monitors")
+
+
+def test_each_shot_has_at_most_one_speaker():
+    """Otherwise the camera can never cut between two people talking."""
+    for source in (SCRIPT, PROSE):
+        for shot in Screenwriter().write(source, StoryMeta()).shots:
+            speakers = {l.key for l in shot.lines if not l.is_narration}
+            assert len(speakers) <= 1
+
+
+def test_prose_dialogue_is_attributed_through_pronouns():
+    """Regression: `"...," she said` used to be credited to the wrong character."""
+    production = Screenwriter().write(PROSE, StoryMeta(format="short"))
+    spoken = {l.character.upper(): l.text for s in production.shots for l in s.lines}
+    assert "We are out of time." in spoken.get("MAYA", "")
+    assert "Then we go tonight." in spoken.get("JONAS", "")
+
+
+def test_narration_does_not_repeat_the_dialogue_or_its_attribution():
+    production = Screenwriter().write(PROSE, StoryMeta(format="short"))
+    narration = " ".join(l.text for s in production.shots for l in s.lines if l.is_narration)
+    assert "out of time" not in narration
+    assert "she said" not in narration and "Jonas replied" not in narration
+
+
+def test_protagonist_named_once_is_still_cast():
+    """A short story often names its lead exactly once."""
+    names = {c.name for c in Screenwriter().extract_characters(PROSE)}
+    assert {"Maya", "Jonas"} <= names
+
+
+def test_common_nouns_are_not_mistaken_for_characters():
+    text = "Banks of monitors glow. The rain fell. Outside, the rain kept falling."
+    names = {c.name for c in Screenwriter().extract_characters(text)}
+    assert not ({"Banks", "Rain", "Outside", "The"} & names)
+
+
+BRIEF = (
+    "A 20 second vertical advert for Kestrel Coffee. Ama, a barista, tells a tired "
+    "commuter named Dev that the first cup is on the house."
+)
+
+
+def test_brand_names_are_not_cast_as_characters():
+    """Regression: "Kestrel Coffee" used to become two speaking characters."""
+    names = {c.name for c in Screenwriter().extract_characters(BRIEF)}
+    assert names == {"Ama", "Dev"}
+
+
+def test_introduced_characters_outrank_bare_capitals():
+    names = {c.name for c in Screenwriter().extract_characters("A film about a woman named Ada.")}
+    assert "Ada" in names
+
+
+def test_reported_speech_becomes_real_dialogue():
+    """A brief describes speech; the narrator must not read the brief aloud."""
+    production = Screenwriter().write(BRIEF, StoryMeta(format="ad"))
+    spoken = [(l.character.upper(), l.text) for s in production.shots for l in s.lines]
+    assert ("AMA", "The first cup is on the house.") in spoken
+    narration = " ".join(l.text for s in production.shots for l in s.lines if l.is_narration)
+    assert "advert" not in narration and "tells a tired commuter" not in narration
+
+
+def test_reported_speech_handles_the_plain_form():
+    lines = Screenwriter().reported_speech("Ama says the coffee is free today.", ["Ama"])
+    assert lines and lines[0][0] == "Ama"
+    assert lines[0][1] == "The coffee is free today."
+
+
+def test_reported_speech_ignores_unknown_speakers():
+    assert Screenwriter().reported_speech("Bob tells Ann that it is fine.", ["Ama"]) == []
+
+
+def test_style_directives_are_not_narrated():
+    from video_gen.screenwriter import _is_directive
+
+    assert _is_directive("Warm and friendly, anime style.")
+    assert _is_directive("Cinematic realistic tone.")
+    assert not _is_directive("Maya had run the night shift for three years.")
+
+
+def test_title_strips_a_brief_preamble():
+    # Regression: the title used to be the whole instruction sentence.
+    assert Screenwriter.derive_title(BRIEF) == "Kestrel Coffee"
+    assert Screenwriter.derive_title("Maya had run the night shift.") == "Maya had run the night shift"
+
+
+def test_shot_framing_varies():
+    production = Screenwriter().write(SCRIPT, StoryMeta(format="short"))
+    assert production.shots[0].shot_type == "establishing"
+    assert len({s.shot_type for s in production.shots}) > 1
+
+
+def test_every_shot_gets_a_visual_prompt_carrying_the_style():
+    production = Screenwriter().write(SCRIPT, StoryMeta(style="3d"))
+    suffix_word = str(STYLE_TIERS["3d"]["prompt_suffix"]).split(",")[0]
+    for shot in production.shots:
+        assert shot.visual and suffix_word in shot.visual
+
+
+def test_empty_prompt_is_rejected():
+    with pytest.raises(ValueError, match="empty"):
+        Screenwriter().write("   \n  ")
+
+
+def test_format_changes_pacing():
+    ad = Screenwriter().write(PROSE, StoryMeta(format="ad", target_seconds=30))
+    doc = Screenwriter().write(PROSE, StoryMeta(format="educational", target_seconds=120))
+    assert ad.estimated_duration != doc.estimated_duration
+
+
+def test_beats_never_drop_or_reorder_sentences():
+    sentences = [f"Sentence {i}." for i in range(9)]
+    groups = Screenwriter._group(sentences, 4)
+    assert len(groups) == 4 and " ".join(groups) == " ".join(sentences)
+    assert len(Screenwriter._group(["One.", "Two."], 8)) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Interview
+# --------------------------------------------------------------------------- #
+
+
+def test_inference_reads_the_prompt():
+    meta = infer_meta("A funny 45 second vertical advert for a bike shop, anime style, for teens")
+    assert meta.format == "ad"
+    assert meta.aspect == "9:16"
+    assert meta.style == "2d"
+    assert meta.target_seconds == 45
+    assert meta.audience == "teens"
+    assert meta.tone == "playful"
+
+
+def test_inference_understands_minutes():
+    assert infer_meta("a 2 minute explainer").target_seconds == 120
+
+
+def test_inference_falls_back_to_format_defaults():
+    meta = infer_meta("a short film about a lighthouse")
+    assert meta.target_seconds == 0
+    assert meta.resolved_target() == FORMATS["short"]["target_seconds"]
+
+
+def test_interview_is_a_no_op_when_non_interactive():
+    meta = Interview(ask=None).run("a short film about a lighthouse")
+    assert meta.format == "short"
+
+
+def test_interview_answers_are_applied_and_coerced():
+    meta = infer_meta("x")
+    Interview._apply(meta, {"format": "ad", "aspect": "9:16", "target_seconds": "20 seconds",
+                            "cast": "Ana, Bo", "style": "3d"})
+    assert (meta.format, meta.aspect, meta.style) == ("ad", "9:16", "3d")
+    assert meta.target_seconds == 20
+    assert meta.character_names == ["Ana", "Bo"]
+
+
+def test_interview_ignores_nonsense_answers():
+    meta = infer_meta("a short film")
+    Interview._apply(meta, {"format": "not-a-format", "aspect": "banana"})
+    assert meta.format == "short" and meta.aspect == "16:9"
+
+
+def test_explicit_overrides_beat_inference_and_are_never_asked():
+    asked = []
+
+    def ask(prompt, default):
+        asked.append(prompt)
+        return default
+
+    meta = Interview(ask=ask).run("a vertical tiktok advert", {"aspect": "16:9"})
+    assert meta.aspect == "16:9"
+    assert not any("Aspect" in q for q in asked)
+
+
+# --------------------------------------------------------------------------- #
+# Casting
+# --------------------------------------------------------------------------- #
+
+
+POOL = [
+    SystemVoice("Samantha", "en_US", "female", "adult"),
+    SystemVoice("Kathy", "en_US", "female", "adult"),
+    SystemVoice("Fred", "en_US", "male", "adult"),
+    SystemVoice("Daniel", "en_GB", "male", "adult"),
+    SystemVoice("Junior", "en_US", "male", "child"),
+    SystemVoice("Grandma", "en_US", "female", "elder"),
+    SystemVoice("Zarvox", "en_US", "neutral", "adult", novelty=True),
+]
+
+
+def test_traits_come_from_description():
+    assert infer_traits(Character("X", description="A sharp woman. She runs the shift."))["gender"] == "female"
+    assert infer_traits(Character("Y", description="An older man, cautious."))["gender"] == "male"
+    assert infer_traits(Character("Z", description="An elderly woman."))["age"] == "elder"
+    assert infer_traits(Character("W", description="A curious boy."))["age"] == "child"
+
+
+def test_young_woman_is_not_a_child():
+    # Regression: "young" used to match the child hint and cast leads as kids.
+    assert infer_traits(Character("Maya", description="A sharp young woman."))["age"] == "adult"
+
+
+def test_name_supplies_gender_when_a_script_says_nothing_else():
+    """Regression: a bare `MAYA:` used to be cast with a male voice."""
+    assert cast_voice(Character("Maya"), POOL).gender == "female"
+    assert cast_voice(Character("Jonas"), POOL).gender == "male"
+
+
+def test_description_beats_the_name_table():
+    voice = cast_voice(Character("Maya", description="He is a tall man, gruff."), POOL)
+    assert voice.gender == "male"
+
+
+def test_novelty_voices_are_not_cast_normally():
+    assert cast_voice(Character("Ada", description="A woman."), POOL).voice != "Zarvox"
+
+
+def test_casting_is_deterministic_and_distinct():
+    cast_a = [Character("Maya", description="a woman"), Character("Jonas", description="a man"),
+              Character("Tim", description="a young boy"), Character("Ada", description="an elderly woman")]
+    cast_b = [Character(c.name, description=c.description) for c in cast_a]
+    cast_production(cast_a, POOL)
+    cast_production(cast_b, POOL)
+    assert [c.voice.voice for c in cast_a] == [c.voice.voice for c in cast_b]
+    assert len({c.voice.voice for c in cast_a}) == len(cast_a), "voices must be distinct"
+    assert cast_a[2].voice.voice == "Junior" and cast_a[3].voice.voice == "Grandma"
+
+
+def test_casting_order_does_not_change_the_result():
+    forward = [Character("Maya", description="a woman"), Character("Jonas", description="a man")]
+    backward = [Character("Jonas", description="a man"), Character("Maya", description="a woman")]
+    cast_production(forward, POOL)
+    cast_production(backward, POOL)
+    assert {c.name: c.voice.voice for c in forward} == {c.name: c.voice.voice for c in backward}
+
+
+def test_existing_voices_are_never_overridden():
+    member = Character("Maya", voice=VoiceProfile("system", "Daniel"))
+    cast_production([member], POOL)
+    assert member.voice.voice == "Daniel"
+
+
+def test_shaping_stays_in_a_natural_range():
+    for name in ("Maya", "Jonas", "Ada", "Tim", "Priya"):
+        voice = cast_voice(Character(name), POOL)
+        assert 0.85 <= voice.rate <= 1.15
+        assert -5.0 <= voice.pitch <= 5.0
+
+
+def test_empty_pool_degrades_to_silence():
+    assert cast_voice(Character("Maya"), []).engine == "silent"
+
+
+# --------------------------------------------------------------------------- #
+# Speech
+# --------------------------------------------------------------------------- #
+
+
+def test_pitch_shift_is_accurate_in_both_directions():
+    rate = 22050
+    tone = np.sin(2 * np.pi * 220 * np.arange(rate) / rate).astype(np.float32)
+    for semitones in (-5, -2, 2, 5):
+        shifted = apply_pitch(tone, semitones)
+        peak = np.fft.rfftfreq(len(shifted), 1 / rate)[np.argmax(np.abs(np.fft.rfft(shifted)))]
+        assert peak == pytest.approx(220 * 2 ** (semitones / 12), rel=0.02)
+
+
+def test_zero_shift_is_a_no_op():
+    tone = np.sin(np.linspace(0, 20, 1000)).astype(np.float32)
+    assert np.array_equal(apply_pitch(tone, 0.0), tone)
+    assert np.array_equal(apply_rate(tone, 1.0), tone)
+
+
+def test_rate_change_shortens_audio():
+    tone = np.sin(np.linspace(0, 20, 1000)).astype(np.float32)
+    assert len(apply_rate(tone, 2.0)) == pytest.approx(500, abs=2)
+
+
+def test_normalize_scales_to_peak_and_leaves_silence_alone():
+    samples = np.array([0.1, -0.05, 0.02], dtype=np.float32)
+    assert float(np.max(np.abs(normalize(samples)))) == pytest.approx(0.89, abs=1e-5)
+    silence = np.zeros(16, dtype=np.float32)
+    assert np.array_equal(normalize(silence), silence)
+
+
+def test_speech_reports_a_real_measured_duration(tmp_path):
+    speech = SpeechSynthesizer(allow_neural=False)
+    long_path, long_seconds = speech.speak(
+        "The signal is back, and it is getting stronger every hour.",
+        VoiceProfile("system", ""), tmp_path / "long.wav",
+    )
+    _, short_seconds = speech.speak("Yes.", VoiceProfile("system", ""), tmp_path / "short.wav")
+    assert long_path.exists() and long_path.stat().st_size > 0
+    assert long_seconds > short_seconds > 0
+
+
+def test_voiced_and_silent_lines_are_counted(tmp_path):
+    """A mute film must be detectable, not shipped quietly."""
+    speech = SpeechSynthesizer(allow_neural=False)
+    speech.speak("Hello there friend.", VoiceProfile("system", ""), tmp_path / "a.wav")
+    assert speech.voiced_lines >= 1 or speech.silent_lines >= 1
+    if speech.command:
+        assert speech.voiced_lines == 1 and speech.silent_lines == 0
+
+
+def test_missing_synthesiser_is_detectable(tmp_path):
+    """Regression: TTS failure produced captions over silence with no warning."""
+    speech = SpeechSynthesizer(allow_neural=False)
+    speech.command = None
+    assert not speech.available
+    ok, detail = speech.probe(tmp_path / "probe.wav")
+    assert not ok and detail
+
+    before = speech.silent_lines  # probe() speaks too, so measure the delta
+    speech.speak("This should have been audible.", VoiceProfile(), tmp_path / "b.wav")
+    assert speech.silent_lines == before + 1 and speech.voiced_lines == 0
+    assert speech.failures, "a silent fallback must record why"
+
+
+def test_probe_confirms_audible_output(tmp_path):
+    speech = SpeechSynthesizer(allow_neural=False)
+    if speech.command:  # only meaningful where a synthesiser exists
+        ok, detail = speech.probe(tmp_path / "probe.wav")
+        assert ok, detail
+
+
+def test_stale_silent_profile_still_speaks(tmp_path):
+    """A `silent` engine saved by another machine must not mute a character."""
+    speech = SpeechSynthesizer(allow_neural=False)
+    if not speech.command:
+        pytest.skip("no system synthesiser here")
+    _, duration = speech.speak(
+        "Speak this anyway.", VoiceProfile(engine="silent"), tmp_path / "c.wav"
+    )
+    assert speech.voiced_lines == 1 and duration > 0.2
+
+
+def test_empty_line_yields_silence_not_a_crash(tmp_path):
+    path, seconds = SpeechSynthesizer(allow_neural=False).speak(
+        "", VoiceProfile(), tmp_path / "empty.wav"
+    )
+    assert path.exists() and seconds > 0
+
+
+# --------------------------------------------------------------------------- #
+# Music and mix
+# --------------------------------------------------------------------------- #
+
+
+def test_score_matches_requested_length():
+    assert len(score_timeline([(0, 6, "tense"), (6, 12, "warm")], 12.0)) == int(12 * 44100)
+
+
+def test_moods_produce_different_cues():
+    assert not np.allclose(render_bed(3, "tense", 1), render_bed(3, "warm", 1))
+
+
+@pytest.mark.parametrize("mood", sorted(MOODS))
+def test_every_mood_renders_finite_audio(mood):
+    bed = render_bed(2.0, mood, seed=3)
+    assert np.isfinite(bed).all() and np.abs(bed).max() <= 1.2
+
+
+def test_ducking_drops_the_bed_only_under_speech():
+    bed = np.ones(44100 * 12, dtype=np.float32)
+    ducked = duck(bed, [(1.0, 3.0), (7.0, 9.0)], depth_db=-11.0)
+
+    def rms(signal, start, end):
+        return float(np.sqrt((signal[int(start * 44100) : int(end * 44100)] ** 2).mean()))
+
+    assert rms(ducked, 1.4, 2.6) == pytest.approx(10 ** (-11 / 20), abs=0.03)
+    assert rms(ducked, 4.5, 5.5) == pytest.approx(1.0, abs=0.02)
+    assert rms(ducked, 7.4, 8.6) == pytest.approx(10 ** (-11 / 20), abs=0.03)
+
+
+def test_ducking_with_no_speech_is_a_no_op():
+    bed = np.ones(1000, dtype=np.float32)
+    assert np.array_equal(duck(bed, []), bed)
+
+
+def test_mood_is_read_from_the_scene():
+    assert mood_for("They ran for the door, an emergency") == "urgent"
+    assert mood_for("A quiet home, family and comfort") == "warm"
+    assert mood_for("nothing in particular") == "neutral"
+
+
+# --------------------------------------------------------------------------- #
+# Visual backends
+# --------------------------------------------------------------------------- #
+
+
+def request_for(**kwargs) -> ShotRequest:
+    defaults = dict(prompt="a control room at night", frame_size=(320, 180), seed=42,
+                    image_size=128, shot_type="medium", duration=2.0, fps=12)
+    defaults.update(kwargs)
+    return ShotRequest(**defaults)
+
+
+def test_procedural_backend_is_always_available():
+    backend = ProceduralBackend()
+    assert backend.available() and STILL in backend.capabilities()
+
+
+def test_procedural_plate_matches_the_frame_aspect():
+    """Regression: a square plate got cropped, slicing the staged figures off."""
+    visual = ProceduralBackend().render(request_for(frame_size=(320, 180)))
+    width, height = visual.image.size
+    assert width / height == pytest.approx(320 / 180, rel=0.02)
+
+    portrait = ProceduralBackend().render(request_for(frame_size=(180, 320)))
+    assert portrait.image.size[1] > portrait.image.size[0]
+
+
+def test_procedural_output_is_deterministic_and_never_blank():
+    first = ProceduralBackend().render(request_for(seed=7)).image
+    second = ProceduralBackend().render(request_for(seed=7)).image
+    third = ProceduralBackend().render(request_for(seed=8)).image
     assert np.array_equal(np.asarray(first), np.asarray(second))
-    assert len(list(generator.image_cache_dir.glob("*.png"))) == 1
+    assert not np.array_equal(np.asarray(first), np.asarray(third))
+    assert np.asarray(first.convert("L")).std() > 2.0  # not a flat/black frame
 
 
-def test_image_cache_survives_cleanup(generator):
-    """Regression: the cache used to live in temp_dir and be wiped every run."""
-    generator.generate_image("a quiet harbour", seed_salt=1)
-    generator.cleanup()
-    assert list(generator.image_cache_dir.glob("*.png"))
+def test_palette_seed_holds_the_look_across_shots():
+    """Regression: shots picked unrelated hues and the cuts read as glitches."""
+    def mean_hue(seed):
+        visual = ProceduralBackend().render(request_for(seed=seed, palette_seed=99))
+        return np.asarray(visual.image.convert("RGB"), dtype=float).mean(axis=(0, 1))
+
+    a, b = mean_hue(1), mean_hue(2)
+    assert np.abs(a - b).max() < 60, "same palette seed must keep the same colour family"
+
+
+def test_character_palette_is_stable_and_distinct():
+    assert character_palette("Maya") == character_palette("Maya")
+    assert character_palette("Maya") != character_palette("Jonas")
+
+
+def test_staging_changes_with_shot_type():
+    wide = ProceduralBackend().render(
+        request_for(shot_type="wide", characters=[CharacterRef("Maya", speaking=True)])
+    ).image
+    close = ProceduralBackend().render(
+        request_for(shot_type="close", characters=[CharacterRef("Maya", speaking=True)])
+    ).image
+    assert not np.array_equal(np.asarray(wide), np.asarray(close))
+
+
+def test_speaking_character_is_rendered_differently():
+    speaking = ProceduralBackend().render(
+        request_for(characters=[CharacterRef("Maya", speaking=True)])
+    ).image
+    silent = ProceduralBackend().render(
+        request_for(characters=[CharacterRef("Maya", speaking=False)])
+    ).image
+    assert not np.array_equal(np.asarray(speaking), np.asarray(silent))
+
+
+def test_mock_backend_produces_motion_when_asked():
+    visual = MockBackend().render(request_for(want_motion=True, duration=2.0, fps=12))
+    assert visual.is_motion and len(visual.frames) == 24
+    assert MOTION in visual.used
+
+
+def test_mock_backend_degrades_to_a_still_without_motion():
+    """The capability-degrade path: no motion model still yields a film."""
+    visual = MockBackend(capabilities={STILL}).render(request_for(want_motion=True))
+    assert not visual.is_motion and visual.image is not None
+    assert MOTION not in visual.used
+
+
+def test_identity_is_used_only_when_a_reference_exists(tmp_path):
+    reference = tmp_path / "face.png"
+    Image.new("RGB", (8, 8)).save(reference)
+    with_ref = MockBackend().render(
+        request_for(characters=[CharacterRef("Maya", reference_image=reference)])
+    )
+    without = MockBackend().render(request_for(characters=[CharacterRef("Maya")]))
+    assert IDENTITY in with_ref.used
+    assert IDENTITY not in without.used
+
+
+def test_shot_visual_must_carry_something():
+    with pytest.raises(ValueError):
+        ShotVisual(backend="x")
+
+
+def test_registry_selection_and_reporting():
+    registry = BackendRegistry([MockBackend(), ProceduralBackend()])
+    assert registry.select().name == "procedural"  # priority 10 beats mock's 5
+    assert registry.select("mock").name == "mock"
+    with pytest.raises(ValueError, match="not available"):
+        registry.select("nonexistent")
+    names = {row["name"] for row in registry.report()}
+    assert names == {"mock", "procedural"}
+
+
+def test_registry_skips_unavailable_backends():
+    registry = BackendRegistry([MockBackend(is_available=False), ProceduralBackend()])
+    assert [b.name for b in registry.available()] == ["procedural"]
+    report = {row["name"]: row for row in registry.report()}
+    assert report["mock"]["available"] is False
+    assert report["mock"]["capabilities"] == []
+
+
+def test_registry_survives_a_backend_that_raises_on_probe():
+    class Exploding:
+        name, priority = "boom", 999
+
+        def available(self):
+            raise RuntimeError("probe failed")
+
+        def capabilities(self):
+            return set()
+
+        def render(self, request):
+            raise RuntimeError
+
+        def describe(self):
+            return "always explodes"
+
+    registry = BackendRegistry([Exploding(), ProceduralBackend()])
+    assert registry.select().name == "procedural"
+    assert {r["name"] for r in registry.report()} == {"boom", "procedural"}
+
+
+def test_diffusion_backend_reports_unavailable_here_with_a_reason():
+    """It must never claim capabilities it cannot deliver on this machine."""
+    from video_gen.visuals.diffusion import DiffusionBackend
+
+    backend = DiffusionBackend()
+    if not backend.available():  # the expected case on this machine
+        assert backend.capabilities() == set()
+        assert "torch" in backend.describe()
 
 
 # --------------------------------------------------------------------------- #
-# Ken Burns
+# Rendering
 # --------------------------------------------------------------------------- #
 
 
-def test_ken_burns_frames_are_in_bounds(generator):
-    image = FreeTextToVideoGenerator.render_scene_card("test", 1, (256, 256))
-    clip = generator.make_scene_clip(image, duration=4.0, seed=3, overlay_text="Caption here")
-    width, height = generator.config.resolution
-    for t in (0.0, 0.001, 2.0, 3.999, 4.0):
-        frame = clip.frame_function(t)
-        assert frame.shape == (height, width, 3)
-        assert frame.dtype == np.uint8
+def test_shot_starts_account_for_crossfade_overlap():
+    durations = [5.0, 4.0, 3.0]
+    fade = FilmRenderer.crossfade_for(durations)
+    assert fade == CROSSFADE_SECONDS
+    starts = FilmRenderer.shot_starts(durations, fade)
+    # Regression: audio placed at full shot lengths drifts by one fade per cut.
+    assert starts == pytest.approx([0.0, 4.65, 8.3])
+    assert starts[-1] + durations[-1] == pytest.approx(sum(durations) - 2 * fade)
 
 
-def test_ken_burns_actually_moves(generator):
-    image = FreeTextToVideoGenerator.render_scene_card("test", 5, (256, 256))
-    clip = generator.make_scene_clip(image, duration=4.0, seed=5)
-    assert not np.array_equal(clip.frame_function(0.0), clip.frame_function(4.0))
+def test_crossfade_is_capped_and_disabled_sensibly():
+    assert 0 < FilmRenderer.crossfade_for([0.6, 0.6]) < CROSSFADE_SECONDS
+    assert FilmRenderer.crossfade_for([5.0]) == 0.0
+    assert FilmRenderer.crossfade_for([0.1, 0.1]) == 0.0
 
 
-def test_ken_burns_handles_zero_duration(generator):
-    image = FreeTextToVideoGenerator.render_scene_card("test", 1, (64, 64))
-    clip = generator.make_scene_clip(image, duration=0.0, seed=1)
-    assert clip.frame_function(0.0).shape[:2] == generator.config.resolution[::-1]
+def test_timeline_blends_between_shots(renderer):
+    from video_gen.render import RenderedShot
+
+    red = np.zeros((180, 320, 3), np.uint8)
+    red[..., 0] = 255
+    blue = np.zeros((180, 320, 3), np.uint8)
+    blue[..., 2] = 255
+    shots = [RenderedShot(4.0, lambda t: red), RenderedShot(4.0, lambda t: blue)]
+    fade = FilmRenderer.crossfade_for([4.0, 4.0])
+    timeline = renderer.build_timeline(shots, fade)
+
+    assert timeline.duration == pytest.approx(8.0 - fade)
+    assert timeline.frame_function(0.5)[0, 0, 0] > 200
+    assert timeline.frame_function(timeline.duration - 0.5)[0, 0, 2] > 200
+    middle = timeline.frame_function(FilmRenderer.shot_starts([4.0, 4.0], fade)[1] + fade / 2)
+    assert middle[0, 0, 0] > 20 and middle[0, 0, 2] > 20  # both shots contribute
 
 
-def test_overlay_is_confined_to_its_bounding_box(generator):
-    overlay = generator.build_overlay("A caption that should sit in the lower third.")
-    assert overlay is not None
-    _, _, (x0, y0, box_w, box_h) = overlay
-    width, height = generator.config.resolution
+def test_timeline_covers_its_whole_duration(renderer):
+    from video_gen.render import RenderedShot
+
+    frame = np.zeros((180, 320, 3), np.uint8)
+    durations = [3.0, 2.5, 4.0]
+    shots = [RenderedShot(d, lambda t: frame) for d in durations]
+    timeline = renderer.build_timeline(shots, FilmRenderer.crossfade_for(durations))
+    for i in range(41):
+        assert timeline.frame_function(timeline.duration * i / 40).shape == (180, 320, 3)
+
+
+def test_camera_moves_actually_move(renderer):
+    image = ProceduralBackend().render(request_for(image_size=128)).image
+    for camera in ("push in", "pan left", "static"):
+        frame_at = renderer._base_renderer(
+            ShotVisual("x", image=image), duration=3.0, camera=camera, seed=1
+        )
+        assert not np.array_equal(frame_at(0.0), frame_at(3.0)), f"{camera} produced a freeze"
+
+
+def test_motion_frames_are_played_back_and_held(renderer):
+    frames = [Image.new("RGB", (64, 36), (i * 20, 0, 0)) for i in range(5)]
+    frame_at = renderer._base_renderer(
+        ShotVisual("x", frames=frames, frame_rate=5.0), duration=4.0, camera="static", seed=1
+    )
+    assert frame_at(0.0).shape == (180, 320, 3)
+    assert not np.array_equal(frame_at(0.0), frame_at(0.6))
+    # Past the end of a short clip the last frame is held, never an index error.
+    assert np.array_equal(frame_at(3.9), frame_at(0.99))
+
+
+def test_caption_carries_a_speaker_label_and_stays_in_frame(renderer):
+    caption = renderer.build_caption(Line("Maya", "We are out of time."), (255, 0, 0))
+    assert caption is not None
+    x0, y0, box_w, box_h = caption.box
+    width, height = renderer.config.resolution
     assert 0 <= x0 and x0 + box_w <= width
     assert 0 <= y0 and y0 + box_h <= height
     assert y0 > height / 2, "captions belong in the lower third"
 
 
-def test_overlay_of_empty_text_is_none(generator):
-    assert generator.build_overlay("   ") is None
+def test_narration_captions_have_no_speaker_label(renderer):
+    labelled = renderer.build_caption(Line("Maya", "Hello there friend."), (255, 0, 0))
+    narrated = renderer.build_caption(Line(NARRATOR, "Hello there friend."), (255, 0, 0))
+    assert narrated.box[3] < labelled.box[3]  # no label row
 
 
-def test_overlay_clamps_to_three_lines(generator):
-    overlay = generator.build_overlay(" ".join(["verylongword"] * 200))
-    assert overlay is not None
-    _, _, (_, _, _, box_h) = overlay
-    assert box_h <= generator.config.resolution[1]
+def test_empty_caption_is_none(renderer):
+    assert renderer.build_caption(Line("Maya", "   "), (255, 0, 0)) is None
 
 
-def test_cover_resize_fills_exactly():
-    tall = Image.new("RGB", (100, 400))
-    assert FreeTextToVideoGenerator._cover_resize(tall, (320, 180)).size == (320, 180)
-    wide = Image.new("RGB", (900, 50))
-    assert FreeTextToVideoGenerator._cover_resize(wide, (320, 180)).size == (320, 180)
+def test_long_caption_is_clamped_to_the_frame(renderer):
+    caption = renderer.build_caption(Line("Maya", " ".join(["verylongword"] * 200)), (0, 255, 0))
+    assert caption.box[3] <= renderer.config.resolution[1]
 
 
-# --------------------------------------------------------------------------- #
-# Timeline maths
-# --------------------------------------------------------------------------- #
-
-
-def test_scene_starts_account_for_crossfade_overlap():
-    durations = [5.0, 4.0, 3.0]
-    fade = FreeTextToVideoGenerator._crossfade_for(durations)
-    assert fade == CROSSFADE_SECONDS
-    starts = FreeTextToVideoGenerator._scene_starts(durations, fade)
-    # Regression: narration used to be concatenated at full scene lengths while
-    # the video was shortened by one fade per cut, drifting further every scene.
-    assert starts == pytest.approx([0.0, 4.6, 8.2])
-    total = starts[-1] + durations[-1]
-    assert total == pytest.approx(sum(durations) - 2 * fade)
-
-
-def test_crossfade_shrinks_for_short_scenes():
-    fade = FreeTextToVideoGenerator._crossfade_for([0.6, 0.6])
-    assert 0 < fade < CROSSFADE_SECONDS
-
-
-def test_crossfade_disabled_for_a_single_clip():
-    assert FreeTextToVideoGenerator._crossfade_for([5.0]) == 0.0
-
-
-def test_crossfade_disabled_when_it_would_be_negligible():
-    assert FreeTextToVideoGenerator._crossfade_for([0.1, 0.1]) == 0.0
-
-
-def test_timeline_length_and_crossfade_blending(generator):
-    """The assembled clip must dissolve between scenes, not hard-cut."""
-    red = Image.new("RGB", (64, 64), (255, 0, 0))
-    blue = Image.new("RGB", (64, 64), (0, 0, 255))
-    durations = [4.0, 4.0]
-    fade = FreeTextToVideoGenerator._crossfade_for(durations)
-    renderers = [
-        generator.make_scene_renderer(red, 4.0, seed=1),
-        generator.make_scene_renderer(blue, 4.0, seed=2),
-    ]
-    timeline = generator.build_timeline(renderers, durations, fade)
-
-    assert timeline.duration == pytest.approx(sum(durations) - fade)
-    starts = FreeTextToVideoGenerator._scene_starts(durations, fade)
-
-    early = timeline.frame_function(0.5).astype(float).mean(axis=(0, 1))
-    late = timeline.frame_function(timeline.duration - 0.5).astype(float).mean(axis=(0, 1))
-    assert early[0] > early[2], "first scene should read red"
-    assert late[2] > late[0], "last scene should read blue"
-
-    # Mid-dissolve both scenes contribute, so neither channel dominates.
-    middle = timeline.frame_function(starts[1] + fade / 2).astype(float).mean(axis=(0, 1))
-    assert middle[0] > 20 and middle[2] > 20
-
-
-def test_timeline_covers_its_whole_duration(generator):
-    image = FreeTextToVideoGenerator.render_scene_card("t", 1, (64, 64))
-    durations = [3.0, 2.5, 4.0]
-    fade = FreeTextToVideoGenerator._crossfade_for(durations)
-    renderers = [generator.make_scene_renderer(image, d, seed=i) for i, d in enumerate(durations)]
-    timeline = generator.build_timeline(renderers, durations, fade)
-    width, height = generator.config.resolution
-    steps = 40
-    for i in range(steps + 1):
-        frame = timeline.frame_function(timeline.duration * i / steps)
-        assert frame.shape == (height, width, 3)
-
-
-# --------------------------------------------------------------------------- #
-# Audio
-# --------------------------------------------------------------------------- #
-
-
-def test_speech_returns_a_real_duration(generator, tmp_path):
-    path, duration = generator.generate_speech("The ship was still there.", tmp_path / "a.wav")
-    assert path.exists() and path.stat().st_size > 0
-    assert duration > 0.2
-
-
-def test_empty_narration_yields_silence_not_a_crash(generator, tmp_path):
-    path, duration = generator.generate_speech("", tmp_path / "b.wav")
-    assert path.exists()
-    assert duration == MIN_SCENE_SECONDS
-
-
-def test_narration_text_is_not_polluted_with_voice_tags(generator, tmp_path):
-    """Regression: the original prepended '[female voice]' and the TTS read it."""
-    long_path, long_seconds = generator.generate_speech(
-        "The lighthouse keeper had not seen a ship in forty years.", tmp_path / "long.wav"
-    )
-    short_path, short_seconds = generator.generate_speech("Yes.", tmp_path / "short.wav")
-    assert long_seconds > short_seconds
-    assert long_path.exists() and short_path.exists()
-
-
-def test_normalize_scales_to_peak():
-    samples = np.array([0.1, -0.05, 0.02], dtype=np.float32)
-    assert float(np.max(np.abs(FreeTextToVideoGenerator._normalize(samples)))) == pytest.approx(
-        0.89, abs=1e-5
-    )
-
-
-def test_normalize_leaves_silence_alone():
-    silence = np.zeros(16, dtype=np.float32)
-    assert np.array_equal(FreeTextToVideoGenerator._normalize(silence), silence)
-
-
-def test_rate_change_shortens_audio():
-    samples = np.sin(np.linspace(0, 20, 1000)).astype(np.float32)
-    faster = FreeTextToVideoGenerator._apply_rate(samples, 2.0)
-    assert len(faster) == pytest.approx(500, abs=2)
-    assert np.array_equal(FreeTextToVideoGenerator._apply_rate(samples, 1.0), samples)
-
-
-def test_music_matches_requested_duration(generator):
-    clip = generator.generate_music(5.0, seed=1)
-    assert clip is not None
-    assert clip.duration == pytest.approx(5.0, abs=0.05)
-
-
-def test_music_can_be_disabled(config):
-    config.music = False
-    with FreeTextToVideoGenerator(config) as gen:
-        assert gen.generate_music(5.0, seed=1) is None
-
-
-# --------------------------------------------------------------------------- #
-# Lifecycle
-# --------------------------------------------------------------------------- #
-
-
-def test_cleanup_removes_temp_dir_and_is_idempotent(config):
-    gen = FreeTextToVideoGenerator(config)
-    (gen.temp_dir / "nested").mkdir()
-    (gen.temp_dir / "nested" / "file.wav").write_bytes(b"x")
-    gen.cleanup()
-    assert not gen.temp_dir.exists()
-    # Regression: os.rmdir() failed on subdirs, and atexit + __del__ double-fired.
-    gen.cleanup()
-
-
-def test_context_manager_cleans_up(config):
-    with FreeTextToVideoGenerator(config) as gen:
-        temp_dir = gen.temp_dir
-        assert temp_dir.exists()
+def test_shot_image_cache_survives_cleanup(config):
+    """Regression: the cache used to live in temp_dir and be wiped every run."""
+    registry = BackendRegistry([ProceduralBackend(config)])
+    production = sample_production()
+    with FilmRenderer(config, registry=registry) as film:
+        film.shot_visual(production, production.shots[0], 3.0)
+        temp_dir = film.temp_dir
+        assert list(film.image_cache_dir.glob("*.png"))
     assert not temp_dir.exists()
+    assert list((config.cache_dir / "images").glob("*.png"))
 
 
-def test_missing_image_model_falls_back_rather_than_raising(generator):
-    """With no diffusers installed this must still return a usable image."""
-    image = generator.generate_image("anything at all")
-    assert isinstance(image, Image.Image)
-    assert image.size == (PRESETS["draft"]["image_size"],) * 2
-    # And crucially not a black frame.
-    assert np.asarray(image.convert("L")).std() > 2.0
+def test_cleanup_is_idempotent_and_recursive(config):
+    film = FilmRenderer(config, registry=BackendRegistry([ProceduralBackend(config)]))
+    (film.temp_dir / "nested").mkdir()
+    (film.temp_dir / "nested" / "a.wav").write_bytes(b"x")
+    film.cleanup()
+    assert not film.temp_dir.exists()
+    film.cleanup()  # must not raise
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+def test_renderer_falls_back_when_a_backend_raises(config):
+    class Broken:
+        name, priority = "broken", 500
 
+        def available(self):
+            return True
 
-def test_parser_defaults():
-    args = build_parser().parse_args([])
-    assert args.preset == "standard"
-    assert not args.self_test and not args.yes
+        def capabilities(self):
+            return {STILL}
 
+        def render(self, request):
+            raise RuntimeError("no model")
 
-def test_parser_rejects_unknown_preset():
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["--preset", "ultra"])
+        def describe(self):
+            return "always fails"
 
-
-def test_parser_accepts_a_full_run():
-    args = build_parser().parse_args(
-        ["--preset", "draft", "--variant", "Fast-cut", "--seed", "9", "--yes", "--no-music"]
-    )
-    assert (args.preset, args.variant, args.seed, args.yes, args.no_music) == (
-        "draft", "Fast-cut", 9, True, True,
-    )
+    with FilmRenderer(config, registry=BackendRegistry([Broken()])) as film:
+        production = sample_production()
+        visual = film.shot_visual(production, production.shots[0], 3.0)
+    assert visual.image is not None  # degraded to procedural rather than dying
 
 
 # --------------------------------------------------------------------------- #
@@ -609,31 +1049,68 @@ def test_parser_accepts_a_full_run():
 
 
 @pytest.mark.slow
-def test_full_render_end_to_end(config, tmp_path):
-    """The whole pipeline, offline, asserting the bugs that used to break it."""
-    with FreeTextToVideoGenerator(config) as gen:
-        script, path = gen.generate_from_story(STORY, variant="Cinematic")
-        temp_dir = gen.temp_dir
+def test_full_film_renders_end_to_end(config):
+    """The whole pipeline offline, asserting the bugs that used to break it."""
+    production = Screenwriter().write(SCRIPT, StoryMeta(format="short", title="E2E"))
+    production.id = "e2e"
+    cast_production(production.cast, POOL)
+    store = ProductionStore(config.scripts_dir)
+    store.save(production)
+
+    registry = BackendRegistry([ProceduralBackend(config)])
+    with FilmRenderer(config, registry=registry) as film:
+        path = film.render(production)
+        temp_dir = film.temp_dir
+    store.save(production)
 
     # 1. The MP4 outlives cleanup (it used to be written inside temp_dir).
     assert not temp_dir.exists()
     assert path.exists() and path.stat().st_size > 10_000
     assert path.parent == config.output_dir
 
-    # 2. The render was recorded back into the script file, with real numbers.
-    saved = ScriptStore(config.scripts_dir).load(script.id)
-    assert saved.status == "rendered"
-    assert len(saved.renders) == 1
+    # 2. The render was recorded back into the screenplay with real numbers.
+    saved = store.load("e2e")
+    assert saved.status == "rendered" and len(saved.renders) == 1
     record = saved.renders[0]
-    assert record["output"] == str(path)
-    assert record["elapsed_s"] > 0
-    # 3. Encoded length == sum(scenes) - one crossfade per cut, not the raw sum.
-    expected = sum(s.duration for s in saved.scenes) - CROSSFADE_SECONDS * (len(saved.scenes) - 1)
-    assert record["duration_s"] == pytest.approx(expected, abs=0.35)
+    assert record["elapsed_s"] > 0 and record["shots"] == len(production.shots)
+    # 2b. The render records whether the dialogue was actually audible.
+    assert record["voiced_lines"] + record["silent_lines"] == sum(
+        len(s.lines) for s in saved.shots
+    )
+    assert set(record["cast"]) == {"Maya", "Jonas"}
+    assert len({record["cast"]["Maya"], record["cast"]["Jonas"]}) == 2, "voices must differ"
+
+    # 3. Encoded length == sum(shots) - one crossfade per cut, not the raw sum.
+    durations = [s.duration for s in saved.shots]
+    fade = FilmRenderer.crossfade_for(durations)
+    assert record["duration_s"] == pytest.approx(sum(durations) - fade * (len(durations) - 1), abs=0.4)
 
 
 @pytest.mark.slow
-def test_self_test_entry_point(config):
-    with FreeTextToVideoGenerator(config) as gen:
-        path = gen.self_test()
-    assert path.exists() and path.stat().st_size > 10_000
+def test_motion_backend_renders_a_film(config):
+    """Exercises the frame-sequence path that no local model can drive."""
+    production = Screenwriter().write(SCRIPT, StoryMeta(title="Motion"))
+    production.id = "motion"
+    cast_production(production.cast, POOL)
+    registry = BackendRegistry([MockBackend(config)])
+    with FilmRenderer(config, registry=registry) as film:
+        assert film.backend.name == "mock"
+        path = film.render(production)
+    assert path.exists() and path.stat().st_size > 5_000
+    assert production.renders[0]["backend"] == "mock"
+
+
+@pytest.mark.slow
+def test_portrait_film_renders(config, tmp_path):
+    """9:16 has to work end to end, not just in the config."""
+    vertical = GenerationConfig(
+        preset="draft", aspect="9:16", resolution=(180, 320), fps=12,
+        output_dir=tmp_path / "out", scripts_dir=tmp_path / "s",
+        characters_dir=tmp_path / "c", cache_dir=tmp_path / "cache",
+    )
+    production = Screenwriter().write(SCRIPT, StoryMeta(title="Vertical", aspect="9:16"))
+    production.id = "vertical"
+    cast_production(production.cast, POOL)
+    with FilmRenderer(vertical, registry=BackendRegistry([ProceduralBackend(vertical)])) as film:
+        path = film.render(production)
+    assert path.exists() and path.stat().st_size > 5_000

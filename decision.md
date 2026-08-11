@@ -1,7 +1,18 @@
 # Engineering decisions
 
 The record of what was broken, what was rebuilt, and why. `roadmap.md` covers
-what comes next.
+what comes next; `IMPLEMENTATION.md` is the current build state.
+
+This document has two parts:
+
+- **[Part I — v1](#part-i--v1-repairing-the-slideshow-generator)**: repairing a
+  project that could not run at all, and making it fast.
+- **[Part II — v2](#part-ii--v2-from-slideshow-to-film-engine)**: turning it into
+  a film engine with a cast, shots, dialogue and per-character voices.
+
+---
+
+# Part I — v1: repairing the slideshow generator
 
 ---
 
@@ -303,3 +314,192 @@ overlapping; the encoded duration matches the recorded duration exactly; and
 `video_scripts/<id>.md` gains a `renders:` entry with `status: rendered`.
 
 SD-Turbo timings remain unmeasured on this hardware for the reason in §3.1.
+
+---
+
+# Part II — v2: from slideshow to film engine
+
+The v1 engine produced narrated slideshows: one still per scene, one narrator,
+captions, a music bed. The actual goal is a film — characters that act, a
+distinct voice each, in 2D / 3D / realistic styles, for ads, short films and
+educational content, entirely offline.
+
+The gap was never the image model. It was that there was no notion of a
+**production**: no cast, no shots, no dialogue, no interview. A `Scene` held a
+`visual` string and a `narration` string, which cannot express two people
+talking.
+
+## 10. The platform wall, and what it forced
+
+Verified, not assumed:
+
+- **torch** publishes no macOS x86_64 wheel beyond Python 3.12 (last: 2.2.2, cp312).
+- **onnxruntime** publishes none for cp313 either — which also kills Piper and
+  Kokoro, the obvious torch-free neural TTS escape hatches.
+- `diffusers`, `peft`, `transformers`, `insightface` are all pure-Python and
+  install fine, but every one needs torch or onnxruntime underneath.
+
+This machine runs Python 3.13/3.14 only, so **no neural inference of any kind can
+execute here**. That is not a temporary inconvenience to code around; it is a
+constraint that shapes the architecture:
+
+1. All visual generation sits behind **one Protocol** (`VisualBackend`), so the
+   pipeline never branches on hardware.
+2. A deterministic **`MockBackend`** claims every capability and renders obviously
+   synthetic frames, so the identity, motion and degradation paths are exercised
+   by the test suite even though no model is present.
+3. `--doctor` reports what a machine can actually do, and says *why* when it
+   cannot.
+4. `verify_backends.py` exists to give the diffusion code its first real run on
+   hardware that can load it.
+
+**What this honestly means:** the diffusion tier is written, reviewed and typed,
+and has never been executed. See §16.
+
+### 10.1 The 177 voices that make this work anyway
+
+macOS ships 177 offline voices via `say`, of which **26 are castable** for
+English — 11 female, 11 male, across US, GB, AU, IE, IN and ZA accents, plus
+child (`Junior`) and elder (`Grandma`/`Grandpa`) voices. Per-character voice, the
+single most important part of "a voice for each character", is therefore fully
+solvable on this machine today, with no model and no download.
+
+## 11. Structure: package, not one file
+
+The v1 "keep one file" decision was right at 1,750 lines and stopped being right
+here. The engine is now `video_gen/`, with `video_generator.py` kept as a
+re-export shim so existing imports and `python video_generator.py` still work.
+The seams (`model`, `store`, `casting`, `screenwriter`, `render`, `visuals/`) sit
+where a package split would naturally put them.
+
+## 12. Data model
+
+```
+Production  meta (format, style, aspect, tone, audience, target length)
+  ├ cast    Character[]  name, role, description, appearance,
+  │                      VoiceProfile, reference_image?, identity_ref?, lora?
+  └ scenes  Scene[]      setting, time_of_day, mood
+      └ shots  Shot[]    type, subjects[], action, camera, lines[]
+          └ Line         character, text, delivery
+```
+
+Persisted as markdown + YAML frontmatter, round-trip byte-stable (a test asserts
+it). Cast members also live in `characters/<id>.md` beside their reference art,
+so a character is reusable across productions and hand-editable. `merge_into`
+fills gaps from the store but **never overrides** what a script states — a stored
+character must not silently rewrite the script in front of it.
+
+## 13. Screenwriting, deterministically
+
+Three input shapes, one output:
+
+| input | detection | handling |
+|---|---|---|
+| screenplay | `NAME:` lines and/or sluglines | parsed directly; sluglines set scene, setting and time of day |
+| prose story | neither | sentences → beats; quoted speech → dialogue |
+| brief | brief preamble regex | instruction stripped; reported speech → dialogue |
+
+Notable choices:
+
+- **A name is a word that is never written lower case.** Counting occurrences
+  loses the protagonist of a short story, who is often named exactly once
+  ("Maya had run the night shift..."). Case consistency finds her; "Banks" and
+  "Rain" are excluded because they appear lower case elsewhere or are common nouns.
+- **Adjacent capitalised words are an entity, not two people.** "Kestrel Coffee"
+  was being cast as two speaking characters with their own voices.
+- **Pronoun attribution is resolved to the nearest preceding cast member.**
+  `"We are out of time," she said` was previously credited to the wrong
+  character — worse than leaving it unattributed.
+- **Attribution debris is stripped from narration**, so the narrator does not
+  also say "she said, watching the trace climb".
+- **A brief is not content.** The instruction sentence and trailing style notes
+  ("Warm and friendly, anime style.") are removed, and *reported* speech is
+  converted into actual dialogue: "Ama tells Dev that the first cup is on the
+  house" becomes `AMA: The first cup is on the house.`
+- **One speaker per shot** (`_split_by_speaker`), because two people talking in a
+  single shot means the camera can never cut between them and the staging cannot
+  show who is speaking.
+
+An optional LLM still only rewrites *visual prompts* and stays off the critical
+path. It does not write dialogue — see §17.
+
+## 14. Casting
+
+`discover_voices()` enumerates the host pool at runtime and annotates it. Traits
+come from the description first, then from a ~130-name given-name table. The
+table exists because a screenplay often supplies nothing but `MAYA:` — and
+casting Maya with a male voice is a glaring, immediately audible error, which is
+exactly what happened before it was added.
+
+Distinctness is enforced twice: the best-fitting *unused* voice is preferred, and
+per-character rate (±10%) and pitch (±4 semitones) are applied on top, so even a
+reused voice does not sound like the same performer. Casting is deterministic,
+independent of the order characters were discovered in, never overrides a voice
+already set by hand, and is written back to the character file so it cannot drift
+between renders.
+
+## 15. Audio and picture
+
+- **Measured audio owns the clock.** A shot lasts as long as its dialogue
+  actually takes to speak. This is the v1 A/V-drift fix, preserved.
+- **Dialogue is pinned to its own shot's start** on the crossfaded timeline.
+  Concatenating it instead drifts by one fade per cut.
+- **Ducking, not a fixed low volume.** A gain envelope drops the bed −11 dB
+  across each speech window and is smoothed so the level glides. A fixed level
+  either buries speech or makes the music inaudible. Measured: 0.28× under
+  dialogue, 1.00× between lines.
+- **Score follows scene mood**, with cues crossfaded so a mood change is a
+  transition rather than a cut.
+- **Captions carry a speaker label in that character's colour**, which is what
+  makes a two-hander readable.
+- **Pitch shifting resamples** and lets duration change, because duration is
+  measured afterwards. Preserving it with a phase vocoder added artefacts for no
+  benefit; the first attempt was also inverted (raising pitch lowered it) and is
+  now covered by an FFT test asserting the shifted peak within 2%.
+- **The whole film is still one `VideoClip`** with hand-rolled crossfades — the
+  v1 finding that `concatenate_videoclips(method="compose")` costs 4× still holds.
+
+## 16. Unverified
+
+Everything in `video_gen/visuals/diffusion.py`: model loading, SD-Turbo and SD1.5
+stills, IP-Adapter identity conditioning, AnimateDiff motion, and every timing
+estimate for those paths. It has never been executed (§10). `train_character`
+deliberately raises `NotImplementedError` — a real training loop cannot be
+written blind against hardware that has never run it.
+
+`MockBackend` covers the orchestration around all of it. `verify_backends.py`
+covers the rest, on a machine that can.
+
+## 17. Honest limits
+
+- **Frontier video quality is not reproducible offline.** Seedance, Sora, Veo and
+  Kling are datacenter models. The consumer-runnable open equivalents — Wan 2.x,
+  LTX-Video, CogVideoX, SVD, AnimateDiff — give roughly 2–5 second clips at
+  480–720p, and multi-shot character consistency remains an open research
+  problem rather than a setting.
+- **"2D / 3D / realistic" are style tiers, not three engines** — the same
+  pipeline with different checkpoints and prompt conditioning. There is no 3D
+  geometry anywhere; Blender-class rendering is not viable on a CPU host.
+- **A brief cannot become a full script deterministically.** The engine
+  structures and stages what it is given, and lifts reported speech into
+  dialogue, but it cannot invent 20 seconds of ad copy from one sentence. That
+  needs an LLM writing dialogue, which is on the roadmap and not built.
+- **The procedural tier is stylised, not photoreal**, by design: geometric
+  figures, no lip sync, no limb animation.
+
+## 18. Measured results (v2)
+
+Intel Mac, 16 GB, CPU-only, Python 3.13, procedural backend, no models.
+
+| measurement | result |
+|---|---|
+| `--self-test`: 2 characters, 4 shots → 9.7 s of 720p | **15.1 s** wall clock |
+| vertical ad, 9:16 720×1280 | 15.5 s |
+| castable voices discovered | 26 (11F / 11M, 6 accents) |
+| ducking depth under dialogue | 0.28× (−11 dB), 1.00× between lines |
+| test suite (124, offline) | ~7 s fast, ~25 s with end-to-end renders |
+
+Verified by watching the output: two characters with audibly different voices,
+dialogue sequential and in sync to the last shot, speaker-labelled captions in
+each character's colour, consistent palette across cuts, shot framing varying
+from establishing through close, and 9:16 rendering at a correct 720×1280.
