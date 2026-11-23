@@ -203,6 +203,7 @@ class GenerationConfig:
     captions: bool = True
     speaker_labels: bool = True
     use_llm: bool = False
+    llm_model: str = ""  # name a local model, else the best small one is chosen
     backend: Optional[str] = None  # force one visual backend, else auto-detect
     output_dir: Path = Path("output")
     scripts_dir: Path = Path("video_scripts")

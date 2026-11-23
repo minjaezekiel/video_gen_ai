@@ -38,7 +38,9 @@ from .model import (
     slugify,
     stable_seed,
 )
+from .llm import discover_llm
 from .music import mood_for
+from .writersroom import BRIEF_MAX_WORDS, WritersRoom
 
 LOGGER = logging.getLogger("video_gen.screenwriter")
 
@@ -116,6 +118,15 @@ _NON_NAMES = frozenset(
     Suddenly Inside Outside Today Tomorrow Yesterday After Before During Once Now Next
     It He She They We You I This That These Those There His Her Their Our My Your Its
     Int Ext Fade Cut Scene Shot Title Narrator Voice
+    """.split()
+    # A brief usually opens with an imperative, and a capitalised first word is
+    # otherwise indistinguishable from a name: "Explain photosynthesis..." cast
+    # a character called Explain, which then blocked the writers' room from
+    # inventing anyone real, because the film already had a "cast".
+    + """
+    Explain Describe Show Tell Teach Introduce Demonstrate Advertise Promote Announce
+    Sell Pitch Create Make Write Generate Produce Build Film Shoot Record Design
+    Summarise Summarize Compare Convince Persuade Illustrate Present Walk Give Help
     """.split()
 )
 
@@ -218,10 +229,25 @@ class StoryMeta:
 class Screenwriter:
     """Turns a prompt (idea, story or script) into a `Production`."""
 
-    def __init__(self, use_llm: bool = False) -> None:
-        self.use_llm = use_llm
-        self._llm = None
-        self._llm_failed = False
+    def __init__(
+        self,
+        use_llm: bool = False,
+        llm_client: Optional[object] = None,
+        llm_model: str = "",
+        variation: int = 0,
+    ) -> None:
+        self.use_llm = use_llm or llm_client is not None
+        self._llm_client = llm_client
+        self._llm_model = llm_model
+        # Bumped by the caller to get a different draft of the same prompt;
+        # without it "regenerate" would return the identical script forever.
+        self.variation = variation
+        self._room: Optional[WritersRoom] = None
+        # Seeds the model so the same prompt writes the same script; set per call.
+        self._room_seed_text = ""
+        # Set when a model actually contributed, so the CLI can say so and the
+        # screenplay can record who wrote it.
+        self.written_by = ""
 
     # -- entry point ------------------------------------------------------- #
 
@@ -231,6 +257,7 @@ class Screenwriter:
             raise ValueError("prompt is empty")
         meta = meta or StoryMeta()
         spec = FORMATS.get(meta.format, FORMATS[DEFAULT_FORMAT])
+        self._room_seed_text = prompt
 
         title = meta.title or self.derive_title(prompt)
         production = Production(
@@ -250,8 +277,11 @@ class Screenwriter:
             beats = self._beats_from_script(prompt, production)
         else:
             beats = self._beats_from_prose(prompt, production, meta)
+            beats = self._maybe_write_dialogue(prompt, production, meta, beats)
 
         self._build_scenes(production, beats, spec)
+        if self.written_by:
+            production.config["written_by"] = self.written_by
         if self.use_llm:
             self._enrich(production)
         return production
@@ -377,8 +407,11 @@ class Screenwriter:
         for name in introduced:
             if name in _NON_NAMES or name.lower() in _STOPWORDS or lowered.get(name.lower()):
                 continue
+            # Note this does *not* clear `compound`: "Kestrel Coffee, a small
+            # independent roastery" matches the appositive form exactly like
+            # "Ama, a barista" does, and letting an introduction outrank the
+            # two-capitals rule cast the brand's second word as a character.
             capital[name] = capital.get(name, 0) + 8
-            compound.discard(name)
 
         # Attribution is the strongest evidence of all: "said Maya" / "Maya said".
         for pattern in (_ATTRIB_AFTER, _ATTRIB_BEFORE):
@@ -552,6 +585,74 @@ class Screenwriter:
             groups.append(" ".join(sentences[cursor : cursor + size]).strip())
             cursor += size
         return [g for g in groups if g]
+
+    # -- written dialogue -------------------------------------------------- #
+
+    def _writers_room(self) -> WritersRoom:
+        seed = stable_seed(self._room_seed_text, salt=self.variation)
+        if self._room is None:
+            client = self._llm_client
+            if client is None and self._llm_model:
+                client = discover_llm(model=self._llm_model)
+            self._room = WritersRoom(client=client, seed=seed)
+        self._room.seed = seed
+        return self._room
+
+    def _maybe_write_dialogue(
+        self, prompt: str, production: Production, meta: StoryMeta, beats: List[Beat]
+    ) -> List[Beat]:
+        """Let a model write the dialogue a brief does not contain.
+
+        Two conditions, both necessary:
+
+        * **Nobody speaks yet.** If the deterministic pass already attributed a
+          line to a character, that speech came from the user's own text and is
+          not ours to rewrite.
+        * **The prompt is a brief, not a story.** Below `BRIEF_MAX_WORDS` there
+          is no content to lose; above it the narration *is* the film, and
+          replacing 300 words of someone's story with six invented lines would
+          be rewriting their work rather than finishing it.
+        """
+        if not self.use_llm:
+            return beats
+        if any(not line.is_narration for beat in beats for line in beat.lines):
+            return beats
+        if len(prompt.split()) > BRIEF_MAX_WORDS:
+            LOGGER.info("prompt is a story, not a brief; leaving its narration alone")
+            return beats
+
+        draft = self._writers_room().develop(prompt, meta, production.cast)
+        if draft is None:
+            return beats
+
+        for member in draft.cast:
+            production.add_character(member)
+        self.written_by = draft.model
+        LOGGER.info("writers' room: %s", draft.summary())
+        return self._beats_from_draft(draft, beats)
+
+    @staticmethod
+    def _beats_from_draft(draft, staged: Sequence[Beat]) -> List[Beat]:
+        """One beat per written line, reusing whatever staging was worked out.
+
+        The model wrote words; the deterministic pass already decided where the
+        film happens. Spreading the lines across those locations in order keeps
+        the scene progression it derived from the prompt instead of throwing it
+        away for a single flat location.
+        """
+        places = [
+            (beat.setting or draft.setting, beat.time_of_day or draft.time_of_day, beat.action)
+            for beat in staged
+        ] or [(draft.setting, draft.time_of_day, "")]
+
+        beats: List[Beat] = []
+        for index, line in enumerate(draft.lines):
+            # Monotonic, so scenes still run in the order they were planned.
+            setting, time_of_day, action = places[index * len(places) // max(1, len(draft.lines))]
+            beats.append(
+                Beat(action=action, lines=[line], setting=setting, time_of_day=time_of_day)
+            )
+        return beats
 
     # -- assembly ---------------------------------------------------------- #
 
@@ -728,48 +829,39 @@ class Screenwriter:
 
     # -- optional LLM enrichment ------------------------------------------- #
 
-    def _load_llm(self):  # pragma: no cover - requires model download
-        if self._llm is not None or self._llm_failed:
-            return self._llm
-        try:
-            import torch
-            from transformers import pipeline
+    def _enrich(self, production: Production) -> None:
+        """Rewrite each shot's image prompt, keeping the deterministic one on failure.
 
-            self._llm = pipeline(
-                "text-generation",
-                model="Qwen/Qwen2.5-0.5B-Instruct",
-                torch_dtype=torch.float32,
-                device=-1,
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.info("LLM enrichment unavailable (%s); using deterministic prompts", exc)
-            self._llm_failed = True
-            self._llm = None
-        return self._llm
-
-    def _enrich(self, production: Production) -> None:  # pragma: no cover - needs a model
-        llm = self._load_llm()
-        if llm is None:
+        This runs through the same client as the dialogue, which is the whole
+        reason it now works at all: the old implementation went straight to a
+        `transformers` pipeline, and torch cannot be installed on this machine.
+        """
+        room = self._writers_room()
+        client = room.client
+        if client is None:
             return
         style_suffix = str(STYLE_TIERS.get(production.style, {}).get("prompt_suffix", ""))
+        schema = {
+            "type": "object",
+            "properties": {"prompt": {"type": "string"}},
+            "required": ["prompt"],
+        }
         for shot in production.shots:
-            request = (
-                "Rewrite this into a single vivid image-generation prompt. Describe only "
-                "what is visible: subject, setting, lighting, framing. No dialogue, no "
-                "quotes, under 40 words.\n\n"
-                f"Film: {production.title}\nShot: {shot.shot_type}\n"
-                f"Action: {shot.action or shot.speech}\nAnswer:"
-            )
             try:
-                out = llm(
-                    [{"role": "user", "content": request}],
-                    max_new_tokens=64,
-                    do_sample=False,
-                    return_full_text=False,
+                reply = client.complete(
+                    "You write image-generation prompts. Describe only what is visible: "
+                    "subject, setting, lighting, framing. Never dialogue, never quotes.",
+                    f"Film: {production.title}\nShot: {shot.shot_type}\n"
+                    f"Action: {shot.action or shot.speech}\n"
+                    "Write one vivid prompt under 40 words.",
+                    schema=schema,
+                    seed=stable_seed(shot.visual or shot.action, salt=shot.index),
+                    temperature=0.6,
+                    max_tokens=96,
                 )
-                text = out[0]["generated_text"].strip().strip('"')
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("LLM enrichment failed on shot %s: %s", shot.index, exc)
+                text = str(reply.json().get("prompt", "")).strip().strip('"')
+            except Exception as exc:  # noqa: BLE001 - enrichment is never critical
+                LOGGER.debug("prompt enrichment failed on shot %s: %s", shot.index, exc)
                 continue
-            if 12 <= len(text) <= 400 and "\n" not in text.strip():
-                shot.visual = f"{text}, {style_suffix}"
+            if 12 <= len(text) <= 400 and "\n" not in text:
+                shot.visual = f"{text}, {style_suffix}" if style_suffix else text

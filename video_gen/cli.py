@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+from . import llm
 from .casting import cast_production, describe_pool, discover_voices
 from .config import ASPECTS, DEFAULT_PRESET, FORMATS, PRESETS, STYLE_TIERS, GenerationConfig
 from .interview import Interview, infer_meta
@@ -78,6 +79,8 @@ def print_screenplay(production: Production, full: bool = False) -> None:
         f"  {len(production.scenes)} scene(s) · {len(production.shots)} shots · "
         f"~{production.estimated_duration:.0f}s"
     )
+    if production.config.get("written_by"):
+        print(f"  dialogue written by {production.config['written_by']}")
     if production.cast:
         print("\n  CAST")
         for member in production.cast:
@@ -121,6 +124,15 @@ def command_doctor(config: GenerationConfig) -> int:
         print("        -> renders will have subtitles but NO audible dialogue.")
         print("           macOS: `say` should already exist. Linux: install espeak-ng.")
         print("           Or install requirements-ml.txt for neural TTS.")
+
+    # Same rule as speech: a reachable server is not a working writers' room,
+    # so this generates a line of dialogue and checks it came back usable.
+    print(f"  writers room: {llm.describe()}")
+    if config.use_llm:
+        ok, detail = llm.probe()
+        print(f"                {'OK  ' if ok else 'FAIL'} {detail}")
+    else:
+        print("                (pass --llm to use it, or --doctor --llm to test it)")
 
     print("\n  VISUAL BACKENDS")
     registry = default_registry(config)
@@ -257,6 +269,7 @@ def command_create(config: GenerationConfig, args: argparse.Namespace) -> int:
         captions=config.captions,
         backend=config.backend,
         use_llm=config.use_llm,
+        llm_model=config.llm_model,
         output_dir=config.output_dir,
         scripts_dir=config.scripts_dir,
         characters_dir=config.characters_dir,
@@ -266,8 +279,13 @@ def command_create(config: GenerationConfig, args: argparse.Namespace) -> int:
     store = ProductionStore(config.scripts_dir)
     characters = CharacterStore(config.characters_dir)
 
+    writer = Screenwriter(use_llm=config.use_llm, llm_model=config.llm_model)
+    if config.use_llm:
+        print(f"\n  writers' room: {llm.describe()}")
+
     while True:
-        production = Screenwriter(use_llm=config.use_llm).write(prompt, meta)
+        production = writer.write(prompt, meta)
+        writer.variation += 1  # so [r]egenerate does not return the same draft
         characters.merge_into(production)  # reuse stored appearance/voice
         cast_production(production.cast, discover_voices())
         store.save(production)
@@ -379,7 +397,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--self-test", action="store_true", help="offline end-to-end check")
     parser.add_argument("--no-music", action="store_true")
     parser.add_argument("--no-captions", action="store_true")
-    parser.add_argument("--llm", action="store_true", help="enrich prompts with a local LLM")
+    parser.add_argument(
+        "--llm", action="store_true", help="let a local LLM write dialogue and image prompts"
+    )
+    parser.add_argument("--llm-model", metavar="NAME", default="", help="e.g. llama3.2:1b")
     parser.add_argument("--yes", "-y", action="store_true", help="accept all defaults")
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser
@@ -399,7 +420,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         seed=args.seed,
         music=not args.no_music,
         captions=not args.no_captions,
-        use_llm=args.llm,
+        use_llm=args.llm or bool(args.llm_model),
+        llm_model=args.llm_model,
         backend=args.backend,
     )
 

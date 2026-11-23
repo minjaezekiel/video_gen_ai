@@ -4,7 +4,7 @@
 the build: what is done, what is not, where everything lives, and what cannot be
 verified on this machine.
 
-Last updated: 2026-08-11 · v2 (film engine)
+Last updated: 2026-08-23 · v3 (writers' room)
 
 ---
 
@@ -22,8 +22,62 @@ Last updated: 2026-08-11 · v2 (film engine)
 | 8. Render | ✅ done | single-clip timeline, speaker captions, motion-clip support |
 | 9. CLI | ✅ done | create / render / list / characters / cast / doctor / self-test |
 | 10. Diffusion backend | ⚠️ **written, never executed** | see [Unverified](#unverified-on-this-machine) |
+| 11. Writers' room | ✅ done | a local LLM writes dialogue; **verified here** against Ollama |
 
-**Tests: 128 passing** (125 fast in ~7 s, 3 slow end-to-end renders).
+**Tests: 176 passing** (172 fast in ~8 s, 4 slow: 3 renders + one real-model draft).
+
+### Step 11 — the writers' room (v3)
+
+The engine could stage a story but not *invent* speech, so a brief
+("Explain photosynthesis to primary school kids") produced one shot of the
+narrator reading the instruction back. That was the largest gap that did not
+need a GPU, and it is now closed.
+
+**Ollama, not `transformers`.** The old `--llm` went straight to a HF pipeline
+and could therefore never run here — same torch wall as diffusion. Ollama is a
+native binary with no Python wheel to satisfy, so it works on this machine, and
+`llm.py` speaks to it over HTTP with nothing but `urllib`. `TransformersClient`
+is kept as the fallback for hosts that have torch, and is still unverified.
+
+**Narrow schemas, several calls.** Measured, not assumed: asked for beats of
+five fields, `llama3.2:1b` put the action in `setting` and left half the `text`
+fields empty. Asked only for `{character, text}` pairs, the same model wrote
+usable advertising copy every time. So the division of labour is: the model
+writes *dialogue*, and the deterministic screenwriter keeps doing the staging,
+framing and timing it is already good at. Ollama's JSON-**schema** mode
+constrains decoding, which plain JSON mode does not — a 1B model emits malformed
+JSON often enough that the difference matters.
+
+**Nothing the model says is trusted.** `clean_line` strips re-emitted speaker
+prefixes and stage directions, `echoes` catches the brief being read back,
+`resolve_speaker` refuses to invent cast members, and a draft with fewer than
+`MIN_DRAFT_LINES` usable lines is discarded whole. The deterministic result is
+always still there, so the worst case of a bad model is the behaviour from
+before one was installed.
+
+**Two conditions before the room is asked at all** — both necessary:
+nobody speaks yet (any attributed line came from the user's own text), and the
+prompt is under `BRIEF_MAX_WORDS`. Above that the narration *is* the film, and
+replacing 300 words of someone's story with six invented lines would be
+rewriting their work rather than finishing it.
+
+Bugs this surfaced and fixed along the way:
+
+- `Explain photosynthesis…` cast a character called **Explain**. A capitalised
+  first word is indistinguishable from a name, and the fake cast member then
+  stopped the room inventing anyone real. Instruction verbs joined `_NON_NAMES`.
+- `Kestrel Coffee, a small independent roastery` cast **Coffee**: the
+  "Ama, a barista" introduction rule was clearing the two-capitals brand guard.
+- Both roles in a two-hander got the same gender of voice — invented names miss
+  the given-name table and model descriptions carry no cue. The cast schema now
+  asks for gender outright and states it in the description, which is what
+  `infer_traits` already reads.
+
+Verified on this machine: `--doctor --llm` reports `ollama/llama3.2:1b`; a brief
+now yields two invented characters with distinct voices trading real lines; and
+a socket guard confirms the whole path touches **127.0.0.1 only**, so "entirely
+offline" still holds. Cloud-proxied Ollama models are excluded from auto-selection
+for the same reason.
 
 ### Audio diagnostics (added after a "no voice, only subtitles" report)
 
@@ -57,11 +111,17 @@ file; all 41 discovered voices work with the exact `say` invocation used.
 
 ```bash
 .venv/bin/python -m video_gen --doctor        # what can this machine do?
+.venv/bin/python -m video_gen --doctor --llm  # ...and actually test the model
 .venv/bin/python -m video_gen --self-test     # offline end-to-end, ~15 s
 .venv/bin/python -m pytest test.py            # fast tests
 .venv/bin/python -m pytest test.py -m ''      # + end-to-end renders
 .venv/bin/python -m video_gen "a 30s advert for a bike shop" --yes
+.venv/bin/python -m video_gen "a 30s advert for a bike shop" --yes --llm
 ```
+
+The writers' room needs `ollama serve` and one small local model
+(`ollama pull llama3.2:1b`). Without it `--llm` prints
+`writers' room: none` and everything falls back to the deterministic path.
 
 `python video_generator.py` still works — it is a re-export shim over `video_gen`.
 
@@ -76,6 +136,8 @@ video_gen/
                    + markdown writer/parser (parse_scenes, split_frontmatter)
   store.py         ProductionStore (video_scripts/), CharacterStore (characters/)
   interview.py     infer_meta() + Interview: the clarifying questions
+  llm.py           OllamaClient / TransformersClient / MockLLM, discover_llm(), probe()
+  writersroom.py   WritersRoom: LLM dialogue + the validation gate that guards it
   screenwriter.py  Screenwriter.write() -> Production. The deterministic core.
   casting.py       discover_voices(), infer_traits(), cast_voice(), cast_production()
   speech.py        SpeechSynthesizer, apply_rate/apply_pitch/normalize, wav IO
@@ -101,6 +163,9 @@ cli.command_create
   └ Screenwriter.write(prompt, meta)       -> Production
        ├ looks_like_script? _beats_from_script : _beats_from_prose
        ├ extract_characters / extract_dialogue / reported_speech
+       ├ _maybe_write_dialogue (--llm, and only if nobody speaks yet)
+       │    └ WritersRoom.develop -> invent_cast / write_dialogue / find_setting
+       │         └ validate_cast / validate_lines -> clean_line, echoes, resolve_speaker
        └ _build_scenes -> _split_by_speaker -> Shot(shot_type, camera, visual)
   └ cast_production(cast, discover_voices())
   └ FilmRenderer.render(production)
@@ -165,12 +230,20 @@ raises `NotImplementedError` on purpose — LoRA training cannot be written blin
 
 ## Known gaps
 
-- **A brief cannot become a full script deterministically.** The engine can
-  structure and stage a story, and can lift reported speech into dialogue, but it
-  cannot *invent* 20 seconds of ad copy from one sentence. That is an LLM job —
-  `--llm` currently only rewrites visual prompts, not dialogue.
+- **A brief cannot become a full script *deterministically*.** Without `--llm`
+  the engine still cannot invent 20 seconds of ad copy from one sentence — it
+  structures, stages and lifts reported speech, and the narrator carries the
+  rest. `--llm` is what closes this, and it needs a local model installed.
+- **Dialogue quality is the model's ceiling, not the engine's.** `llama3.2:1b`
+  writes serviceable ad copy but drifts off-brief; it is simply the largest model
+  that answers in seconds on a CPU. `--llm-model` takes anything Ollama has.
+- **A prose story still gets no invented dialogue.** Above `BRIEF_MAX_WORDS` the
+  room is deliberately not asked, because it would have to replace the user's
+  narration in order to add speech. Adding dialogue *alongside* narration is the
+  open design question.
 - **Gender inference falls back to a name table** (~130 names). Unknown names
-  cast as neutral. Override by editing the character's `voice:` in
+  cast as neutral, so an LLM-invented cast is asked for its genders outright.
+  Override by editing the character's description or `voice:` in
   `characters/<id>.md`, or re-roll with `--cast <id>`.
 - **The procedural tier is stylised, not photoreal**, by design. Figures are
   geometric silhouettes; there is no lip sync and no limb animation.
@@ -183,6 +256,10 @@ raises `NotImplementedError` on purpose — LoRA training cannot be written blin
 
 See [roadmap.md](roadmap.md). The highest-value next steps, in order:
 
-1. Run `verify_backends.py` on GPU hardware and fix whatever it finds.
-2. LLM dialogue generation (not just prompt enrichment) so briefs produce real scripts.
-3. LoRA character training, once there is hardware to develop it against.
+1. Run `verify_backends.py` on GPU hardware and fix whatever it finds. This is
+   now the only remaining item that cannot be started on this machine.
+2. Lip sync for the procedural tier — audio-driven mouth states, no model needed,
+   and the largest remaining animation win that is fully runnable here.
+3. `--import-character name image.png`: `CharacterStore.import_reference` already
+   works, it is simply not wired into the CLI or the interview.
+4. LoRA character training, once there is hardware to develop it against.

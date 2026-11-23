@@ -58,6 +58,36 @@ From "narrated slideshow" to "a cast, a shot list and a voice each".
       `--doctor`, `--self-test`
 - [x] **124 tests**, all offline, including mock-driven identity and motion paths
 
+## v3 — Writers' room ✅ complete
+
+The engine could stage a story but not invent speech. A brief produced one shot
+of the narrator reading the instruction back; now it produces a cast having a
+conversation.
+
+- [x] **Local LLM client**: `OllamaClient` over plain `urllib` — a native binary
+      needs no Python wheel, so this runs on the machine where torch cannot be
+      installed at all. `TransformersClient` kept for hosts that have torch;
+      `MockLLM` drives every path in the tests
+- [x] **Offline enforced**: cloud-proxied Ollama models are excluded from
+      auto-selection, and a socket guard confirms the whole path touches
+      127.0.0.1 only
+- [x] **Dialogue generation**: a brief now yields invented characters trading
+      real lines, shaped by the format's own beat structure (hook → problem →
+      product → proof → call to action)
+- [x] **Cast invention**: name, gender and description per character, so two
+      roles in a two-hander get audibly different voices
+- [x] **A validation gate**: re-emitted speaker prefixes and stage directions
+      stripped, the brief-read-back caught, unknown speakers refused, and a thin
+      draft discarded whole — the deterministic script always stands behind it
+- [x] **Never rewrites the user's work**: the room is asked only when nobody
+      speaks yet *and* the prompt is a brief rather than a story
+- [x] **Deterministic**: the same prompt writes the same script; `[r]egenerate`
+      asks for a genuinely different draft
+- [x] **`--doctor --llm`** generates a real line and checks it came back usable,
+      the same way the speech probe does
+- [x] **176 tests**, including one that drives a real local model and skips
+      cleanly without one
+
 ---
 
 ## Not done — known gaps
@@ -68,10 +98,15 @@ motion — is **written but has never been executed**. torch has no macOS x86_64
 wheel past Python 3.12 and onnxruntime none for 3.13, so no neural code can run
 on the development machine at all. This is the single highest-value next step.
 
-**LLM dialogue generation.** `--llm` currently only rewrites visual prompts. A
-brief ("a 20 second advert for X") can be structured and staged, and reported
-speech is lifted into lines, but the engine cannot *invent* ad copy. Writing
-dialogue is the one part of screenwriting that genuinely needs a model.
+**Dialogue quality is capped by the model, not the engine.** `llama3.2:1b` is
+simply the largest model that answers in seconds on a CPU; it writes serviceable
+ad copy but drifts off-brief. `--llm-model` takes anything Ollama has, and a 7B
+model on better hardware is a straight upgrade with no code change.
+
+**A prose story still gets no invented dialogue.** Above `BRIEF_MAX_WORDS` the
+writers' room is deliberately not asked, because adding speech would mean
+replacing the narration the user actually wrote. Adding dialogue *alongside*
+narration is the open design question.
 
 **LoRA character training.** `DiffusionBackend.train_character` raises
 `NotImplementedError` on purpose — a training loop cannot be written blind
@@ -112,6 +147,14 @@ already carried through the model, the store and `ShotRequest`.
 - **`.srt` sidecar** — timings are already computed, this is nearly free.
 - **Batch render** every `accepted` production.
 - **Resume**: skip shots whose cached image and audio are both current.
+
+### Writing
+- **Dialogue alongside narration**, so a prose story can gain speech without
+  losing the narration the user wrote.
+- **A second pass over a draft** — ask the model to tighten its own lines against
+  the target runtime, rather than capping the count in the schema.
+- **Per-scene settings from the room**, so a film can move between locations
+  instead of holding one.
 
 ### Workflow
 - **Style references**: seed a new production's look from a past accepted one.

@@ -14,6 +14,7 @@ paths be tested here despite no model ever being loaded.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,27 @@ from video_gen import (
 )
 from video_gen.casting import SystemVoice, cast_voice, infer_traits
 from video_gen.config import CROSSFADE_SECONDS, MIN_SHOT_SECONDS
+from video_gen.llm import (
+    LLMError,
+    LLMReply,
+    MockLLM,
+    OllamaClient,
+    OllamaModel,
+    discover_llm,
+    extract_json,
+)
+from video_gen.llm import probe as llm_probe
+from video_gen.writersroom import (
+    BRIEF_MAX_WORDS,
+    MAX_LINE_WORDS,
+    MIN_DRAFT_LINES,
+    WritersRoom,
+    clean_line,
+    echoes,
+    resolve_speaker,
+    validate_cast,
+    validate_lines,
+)
 from video_gen.model import NARRATOR, character_key, parse_scenes, slugify, stable_seed
 from video_gen.music import MOODS, duck, mood_for, render_bed, score_timeline
 from video_gen.speech import apply_pitch, apply_rate, normalize
@@ -1041,6 +1063,403 @@ def test_renderer_falls_back_when_a_backend_raises(config):
         production = sample_production()
         visual = film.shot_visual(production, production.shots[0], 3.0)
     assert visual.image is not None  # degraded to procedural rather than dying
+
+
+# --------------------------------------------------------------------------- #
+# The writers' room
+# --------------------------------------------------------------------------- #
+
+
+def mock_room(*replies):
+    """A writers' room wired to a scripted model, so no LLM need be installed."""
+    return WritersRoom(client=MockLLM(replies=list(replies)), seed=1)
+
+
+def dialogue_reply(*pairs):
+    return json.dumps({"lines": [{"character": c, "text": t} for c, t in pairs]})
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("AMA: Morning.", "Morning."),                    # speaker prefix re-emitted
+        ("Ama (warmly): Morning, love.", "Morning, love."),
+        ("(whispering) They can hear us.", "They can hear us."),
+        ('"The first cup is free."', "The first cup is free."),
+        ("we open at six", "We open at six."),            # cased and punctuated
+        ("Sit down (he gestures)", "Sit down."),          # trailing direction removed
+        ("**Bold** claim here", "Bold claim here."),
+    ],
+)
+def test_clean_line_reduces_a_model_reply_to_speech(raw, expected):
+    cleaned = clean_line(raw)
+    assert cleaned is not None
+    assert cleaned[0] == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "Go",                                   # a single word is not a line
+        "INT. KITCHEN - DAY",
+        "CUT TO: the street outside",
+        "FADE IN on a dark room",
+        "# Scene one",
+        "- a bullet point",
+        "THE END OF EVERYTHING WE KNEW",         # all caps: a card, not speech
+    ],
+)
+def test_clean_line_rejects_what_is_not_speech(raw):
+    assert clean_line(raw) is None
+
+
+def test_clean_line_truncates_on_a_sentence_boundary():
+    long = "We roast every morning. " * 12
+    text, _ = clean_line(long)
+    assert len(text.split()) <= MAX_LINE_WORDS
+    assert text.endswith(".")
+    # It cut between sentences rather than mid-phrase.
+    assert not text.endswith("every.")
+
+
+def test_clean_line_keeps_a_parenthetical_as_delivery():
+    text, delivery = clean_line("Ama (whispering): Not here.")
+    assert text == "Not here."
+    assert delivery == "whispering"
+
+
+def test_echoes_catches_the_brief_being_read_back():
+    brief = "a 20 second vertical advert for Kestrel Coffee, a small independent roastery"
+    assert echoes("A twenty second advert for Kestrel Coffee, an independent roastery.", brief)
+    assert not echoes("The first cup is on the house.", brief)
+    # Too short to judge: rejecting these would throw away good punchy lines.
+    assert not echoes("Kestrel Coffee.", brief)
+
+
+def test_resolve_speaker_matches_loosely_but_never_invents():
+    cast = [Character(name="Ama"), Character(name="Dev Patel")]
+    assert resolve_speaker("ama", cast) == "Ama"
+    assert resolve_speaker("AMA", cast) == "Ama"
+    assert resolve_speaker("Dev", cast) == "Dev Patel"      # first name only
+    assert resolve_speaker("Narrator", cast) == NARRATOR
+    assert resolve_speaker("Barista", cast) is None         # not in the cast
+    assert resolve_speaker("", cast) is None
+
+
+def test_validate_lines_keeps_the_good_and_reports_the_rest():
+    cast = [Character(name="Ama"), Character(name="Dev")]
+    rejected = []
+    lines = validate_lines(
+        [
+            {"character": "Ama", "text": "Morning. The usual?"},
+            {"character": "Ghost", "text": "I am not in this film."},
+            {"character": "Dev", "text": "INT. CAFE - DAY"},
+            {"character": "Dev", "text": "Please."},
+            {"character": "Dev", "text": "please"},          # duplicate
+            "not even an object",
+        ],
+        cast,
+        brief="a coffee advert",
+        rejected=rejected,
+    )
+    assert [l.text for l in lines] == ["Morning. The usual?", "Please."]
+    assert [l.character for l in lines] == ["Ama", "Dev"]
+    assert len(rejected) == 4
+
+
+def test_validate_cast_sanitises_invented_characters():
+    cast = validate_cast(
+        [
+            {"name": "  luna  ", "description": "a warm teacher in her forties"},
+            {"name": "Luna", "description": "duplicate"},
+            {"name": "NARRATOR", "description": "not a character"},
+            {"name": "K41r0s!!", "description": "a graduate student, his late twenties"},
+            {"name": "", "description": "nameless"},
+            {"name": "Third", "description": "over the limit"},
+        ],
+        limit=2,
+    )
+    assert [c.name for c in cast] == ["Luna", "Krs"]  # digits stripped, not transliterated
+    # The description survives because `infer_traits` reads it to pick a voice.
+    assert "forties" in cast[0].description
+
+
+def test_an_invented_cast_states_its_genders_so_the_voices_differ():
+    """Both roles in a two-hander used to get the same gender of voice: the
+    model's descriptions carry no cue and invented names miss the name table."""
+    cast = validate_cast(
+        [
+            {"name": "Lena", "gender": "female", "description": "A bright barista."},
+            {"name": "Jasper", "gender": "male", "description": "The owner, with a kind smile."},
+        ]
+    )
+    assert infer_traits(cast[0])["gender"] == "female"
+    assert infer_traits(cast[1])["gender"] == "male"
+
+    voices = [v.voice for v in (cast_voice(c, POOL, taken=[]) for c in cast)]
+    assert len(set(voices)) == 2
+
+    # An already-gendered description is left alone rather than prefixed twice.
+    stated = validate_cast([{"name": "Ama", "gender": "female", "description": "A woman of forty."}])
+    assert stated[0].description == "A woman of forty."
+
+
+def test_the_room_writes_dialogue_for_an_invented_cast():
+    room = mock_room(
+        json.dumps({"characters": [{"name": "Ama", "description": "a warm barista, thirties"},
+                                   {"name": "Dev", "description": "a tired commuter, forties"}]}),
+        dialogue_reply(("Ama", "Morning. The usual?"),
+                       ("Dev", "Make it a double today."),
+                       ("Ama", "First one is on the house."),
+                       ("Dev", "Then I am definitely coming back.")),
+        json.dumps({"setting": "A small roastery", "time_of_day": "day"}),
+    )
+    draft = room.develop("a 20 second advert for a coffee roastery", StoryMeta(format="ad"), [])
+    assert draft is not None
+    assert [c.name for c in draft.cast] == ["Ama", "Dev"]
+    assert len(draft.lines) == 4
+    assert draft.speakers == ["Ama", "Dev"]
+    assert draft.setting == "A Small Roastery"
+
+
+def test_the_room_declines_rather_than_returning_half_a_draft():
+    """Too few usable lines must mean "keep what you had", not a thin film."""
+    room = mock_room(
+        json.dumps({"characters": [{"name": "Ama", "description": "a barista"}]}),
+        dialogue_reply(("Ama", "Morning."), ("Ghost", "Who am I?"), ("Ama", "INT. CAFE - DAY")),
+        json.dumps({"setting": "A cafe", "time_of_day": "day"}),
+    )
+    assert room.develop("an advert for coffee", StoryMeta(format="ad"), []) is None
+
+
+def test_the_room_survives_a_model_that_returns_junk():
+    room = WritersRoom(client=MockLLM(replies=["not json at all", "{{{", ""]), seed=1)
+    assert room.develop("an advert for coffee", StoryMeta(format="ad"), []) is None
+    assert room.last_error
+
+
+def test_the_room_is_absent_without_a_model():
+    room = WritersRoom(client=MockLLM(replies=[], is_available=False))
+    assert not room.available()
+    assert room.develop("anything", StoryMeta(), []) is None
+
+
+def test_a_long_setting_is_a_hallucination_and_is_dropped():
+    """Asked to name a place, a small model will name a real university."""
+    room = mock_room(json.dumps(
+        {"setting": "Chapel Hill Campus, University of North Carolina at Chapel Hill",
+         "time_of_day": "day"}))
+    assert room.find_setting("a film about plants") == ("", "")
+
+
+def test_line_budget_follows_the_format_not_a_constant():
+    ad = WritersRoom.line_budget(StoryMeta(format="ad", target_seconds=30))
+    educational = WritersRoom.line_budget(StoryMeta(format="educational", target_seconds=30))
+    # An advert cuts faster, so the same 30s holds more lines.
+    assert ad > educational
+    assert 3 <= educational <= ad <= 12
+
+
+# --------------------------------------------------------------------------- #
+# The screenwriter's use of the room
+# --------------------------------------------------------------------------- #
+
+
+AD_BRIEF = "A 20 second advert for Kestrel Coffee, a small independent roastery."
+
+
+def brief_writer(*replies):
+    return Screenwriter(llm_client=MockLLM(replies=list(replies)))
+
+
+def test_a_brief_gains_real_dialogue_instead_of_the_narrator_reading_it_back():
+    """The gap this whole phase exists to close."""
+    plain = Screenwriter().write(AD_BRIEF, StoryMeta(format="ad"))
+    assert all(l.is_narration for l in plain.shots[0].lines), "baseline: narrator only"
+
+    written = brief_writer(
+        json.dumps({"characters": [{"name": "Ama", "description": "a warm barista"},
+                                   {"name": "Dev", "description": "a tired commuter"}]}),
+        dialogue_reply(("Ama", "Morning. The usual?"),
+                       ("Dev", "Make it a double today."),
+                       ("Ama", "First one is on the house."),
+                       ("Dev", "Then I am definitely coming back.")),
+        json.dumps({"setting": "A small roastery", "time_of_day": "day"}),
+    ).write(AD_BRIEF, StoryMeta(format="ad"))
+
+    lines = [l for shot in written.shots for l in shot.lines]
+    assert not any(l.is_narration for l in lines), "the narrator no longer reads the brief"
+    assert {l.character for l in lines} == {"Ama", "Dev"}
+    assert {c.name for c in written.cast} >= {"Ama", "Dev"}
+    # One speaker per shot still holds, so the camera can cut between them.
+    assert all(len(set(l.character for l in shot.lines)) <= 1 for shot in written.shots)
+    assert written.config["written_by"] == "mock"
+
+
+def test_a_story_is_not_rewritten_into_a_model_s_version():
+    """Above the brief threshold the narration *is* the film; replacing it
+    would discard the user's work rather than finish it."""
+    story = " ".join(["The lighthouse keeper climbed the stairs every evening at dusk."] * 8)
+    assert len(story.split()) > BRIEF_MAX_WORDS
+    written = brief_writer(dialogue_reply(("Ama", "Nothing to do with this story."))).write(
+        story, StoryMeta()
+    )
+    spoken = [l.text for shot in written.shots for l in shot.lines]
+    assert all("Nothing to do" not in t for t in spoken)
+    assert any("lighthouse" in t.lower() for t in spoken)
+
+
+def test_dialogue_the_user_wrote_is_never_replaced():
+    written = brief_writer(dialogue_reply(("Ama", "An invented line."))).write(
+        SCRIPT, StoryMeta(format="short")
+    )
+    spoken = [l.text for shot in written.shots for l in shot.lines]
+    assert "An invented line." not in spoken
+    assert any("signal is back" in t for t in spoken)
+
+
+def test_a_rejected_draft_leaves_the_deterministic_script_standing():
+    written = brief_writer(
+        json.dumps({"characters": [{"name": "Ama", "description": "a barista"}]}),
+        dialogue_reply(("Ghost", "Not in the cast.")),
+    ).write(AD_BRIEF, StoryMeta(format="ad"))
+    assert written.shots, "still a filmable screenplay"
+    assert "written_by" not in written.config
+
+
+def test_an_opening_imperative_is_not_a_character():
+    """"Explain photosynthesis..." cast a character called Explain, which then
+    stopped the room inventing anyone real, because the film had a "cast"."""
+    production = Screenwriter().write(
+        "Explain photosynthesis to primary school kids", StoryMeta(format="educational")
+    )
+    assert "EXPLAIN" not in {c.key for c in production.cast}
+    for verb in ("Show", "Describe", "Create", "Sell"):
+        cast = Screenwriter().extract_characters(f"{verb} a bicycle to a new rider.")
+        assert verb.upper() not in {c.key for c in cast}
+
+
+def test_the_same_prompt_writes_the_same_script():
+    """Every other stage is deterministic; a re-render must not rewrite the film."""
+    seeds = []
+    for _ in range(2):
+        model = MockLLM(replies=[dialogue_reply(("A", "x"))])
+        Screenwriter(llm_client=model).write(AD_BRIEF, StoryMeta(format="ad"))
+        seeds.append([call["seed"] for call in model.calls])
+    assert seeds[0] == seeds[1] and seeds[0]
+
+
+def test_regenerating_asks_for_a_different_draft():
+    first = MockLLM(replies=[dialogue_reply(("A", "x"))])
+    writer = Screenwriter(llm_client=first)
+    writer.write(AD_BRIEF, StoryMeta(format="ad"))
+    writer.variation += 1
+    writer._llm_client = second = MockLLM(replies=[dialogue_reply(("A", "x"))])
+    writer._room = None
+    writer.write(AD_BRIEF, StoryMeta(format="ad"))
+    assert first.calls[0]["seed"] != second.calls[0]["seed"]
+
+
+# --------------------------------------------------------------------------- #
+# The LLM client
+# --------------------------------------------------------------------------- #
+
+
+def test_cloud_models_are_not_offline_and_are_never_auto_selected():
+    client = OllamaClient()
+    client._models = [
+        OllamaModel("glm-5.1:cloud", 0),
+        OllamaModel("llama3.2:1b", 1_300_000_000),
+        OllamaModel("qwen3-coder:30b", 18_500_000_000),
+    ]
+    assert client.resolve_model() == "llama3.2:1b"
+
+    cloud_only = OllamaClient()
+    cloud_only._models = [OllamaModel("glm-5.1:cloud", 0)]
+    assert cloud_only.resolve_model() == ""
+    assert "not offline" in cloud_only.detail
+
+
+def test_auto_selection_prefers_a_model_this_host_can_actually_run():
+    client = OllamaClient()
+    client._models = [
+        OllamaModel("qwen3-coder:30b", 18_500_000_000),
+        OllamaModel("gemma3:4b", 3_300_000_000),
+    ]
+    assert client.resolve_model() == "gemma3:4b"
+
+
+def test_a_named_model_that_is_not_installed_is_reported_not_guessed():
+    client = OllamaClient(model="does-not-exist:7b")
+    client._models = [OllamaModel("llama3.2:1b", 1_300_000_000)]
+    assert not client.available()
+    assert "not installed" in client.detail
+
+
+def test_no_server_means_no_model_rather_than_an_exception():
+    client = OllamaClient(host="http://127.0.0.1:9")  # nothing listens here
+    assert client.models() == []
+    assert not client.available()
+    with pytest.raises(LLMError):
+        client.complete("s", "u")
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ('{"a": 1}', '{"a": 1}'),
+        ('```json\n{"a": 1}\n```', '{"a": 1}'),
+        ('Sure! Here you go:\n{"a": 1}\nHope that helps.', '{"a": 1}'),
+        ("no json here", ""),
+    ],
+)
+def test_extract_json_survives_a_chatty_model(raw, expected):
+    assert extract_json(raw) == expected
+
+
+def test_a_reply_that_is_not_json_raises_rather_than_returning_junk():
+    with pytest.raises(LLMError):
+        LLMReply(text="I'd be happy to help!", model="m").json()
+
+
+def test_probe_fails_honestly_when_the_model_answers_nothing_useful():
+    ok, detail = llm_probe(MockLLM(replies=['{"line": ""}']))
+    assert not ok and "no dialogue" in detail
+
+    ok, detail = llm_probe(MockLLM(replies=['{"line": "Morning, what can I get you?"}']))
+    assert ok and "6 words" in detail
+
+
+def test_probe_reports_no_model_rather_than_crashing():
+    ok, detail = llm_probe(MockLLM(replies=[], is_available=False))
+    assert not ok
+
+
+# --------------------------------------------------------------------------- #
+# Against a real model, when one happens to be installed
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.slow
+def test_a_real_local_model_writes_usable_dialogue():
+    """The only test here that touches an actual LLM. Skips without one."""
+    client = discover_llm()
+    if client is None:
+        pytest.skip("no local LLM installed")
+    room = WritersRoom(client=client, seed=11)
+    draft = room.develop(
+        "A 20 second advert for Kestrel Coffee, a small independent roastery.",
+        StoryMeta(format="ad", target_seconds=20, tone="warm"),
+        [],
+    )
+    assert draft is not None, f"the room produced nothing usable ({room.last_error})"
+    assert len(draft.lines) >= MIN_DRAFT_LINES
+    for line in draft.lines:
+        assert 2 <= len(line.text.split()) <= MAX_LINE_WORDS
+        assert not any(m in line.text.upper() for m in ("INT.", "EXT.", "CUT TO"))
+        assert not line.text.upper().startswith(line.character.upper() + ":")
 
 
 # --------------------------------------------------------------------------- #

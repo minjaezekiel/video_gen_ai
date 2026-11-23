@@ -503,3 +503,168 @@ Verified by watching the output: two characters with audibly different voices,
 dialogue sequential and in sync to the last shot, speaker-labelled captions in
 each character's colour, consistent palette across cuts, shot framing varying
 from establishing through close, and 9:16 rendering at a correct 720×1280.
+
+---
+
+# Part III — v3: the writers' room
+
+## 19. The gap that did not need a GPU
+
+v2 could stage a story it was given. It could not invent one. Given a brief —
+"Explain photosynthesis to primary school kids", or "a 20 second advert for a
+coffee roastery" — there was no quoted speech to lift and no reported speech to
+convert, so the film came out as a single shot of the narrator reading the
+instruction back. The clip was technically correct and obviously useless.
+
+Writing dialogue is the one part of screenwriting that regular expressions
+genuinely cannot do, and it was the largest remaining gap that did not require
+hardware this machine does not have.
+
+## 20. Ollama, not `transformers`
+
+The `--llm` flag already existed in v2 and had never worked here, because it
+went straight to a Hugging Face pipeline and hit the same wall as diffusion:
+torch publishes no macOS x86_64 wheel past Python 3.12.
+
+Ollama does not have that problem. It is a **native binary** with no Python
+wheel to satisfy, and it speaks HTTP. So `llm.py` talks to it with nothing but
+`urllib` — no `requests`, no SDK, no dependency added to the critical path of a
+feature that is optional by design.
+
+The practical consequence is worth stating plainly: **this is the first
+model-backed feature in the project that could actually be verified on the
+development machine.** Everything in `visuals/diffusion.py` remains written and
+never executed; the writers' room was measured.
+
+`TransformersClient` is kept for hosts that do have torch, and is marked
+unverified alongside the diffusion tier.
+
+### Offline is a promise, not a default
+
+Ollama can proxy cloud models, and one was installed on this machine. A film
+that silently needed the internet would break the only promise this project
+actually makes, so cloud-proxied models are excluded from auto-selection —
+identified by a `:cloud` suffix or a reported size of zero. A socket guard in
+testing confirms the whole generation path touches `127.0.0.1` and nothing else.
+
+## 21. Narrow schemas, several calls
+
+This was decided by measurement, not preference.
+
+`llama3.2:1b` asked for a beat list of five fields (`setting`, `time_of_day`,
+`action`, `character`, `text`) put the action in `setting` and left half the
+`text` fields empty. The same model, asked only for `{character, text}` pairs,
+wrote usable advertising copy every time.
+
+Two conclusions followed:
+
+1. **Split the work by what each side is good at.** The model writes *dialogue*.
+   The deterministic screenwriter keeps doing staging, framing, shot types,
+   camera moves and timing, all of which it already does well. Cast invention
+   and location are separate small calls rather than fields in one big one.
+2. **Use JSON-schema mode, not JSON mode.** A schema constrains decoding; plain
+   "reply with JSON" merely asks. In plain mode the 1B model produced malformed
+   JSON on a nested request; against a schema it never did.
+
+The format's own beat structure — already in `FORMATS` as
+`hook → problem → product → proof → call to action` — is handed to the model as
+the shape to fill. That is what stops a 30-second advert from being six
+unrelated pleasant sentences.
+
+## 22. Nothing the model says is trusted
+
+The validation gate is most of `writersroom.py`, and rejection is the expected
+case rather than an error path:
+
+| Guard | Catches |
+|---|---|
+| `clean_line` | re-emitted speaker prefixes (`AMA: Morning.`), stage directions, sluglines, all-caps cards, markdown debris, over-long lines |
+| `echoes` | the brief being read back at us — the exact failure this phase exists to fix |
+| `resolve_speaker` | invented cast members; matches loosely (`Dev` → `Dev Patel`) but never adds |
+| duplicate check | a model repeating itself, which makes a film stutter |
+| `MIN_DRAFT_LINES` | a thin draft, discarded whole rather than used in part |
+
+The deterministic script is always still there. **The worst case of a bad model
+is the behaviour from before one was installed** — which is also why `--llm`
+could be made default-off without hedging.
+
+`develop()` returns `None` rather than a partial draft on purpose: no caller
+should have to decide whether half a draft is worth using.
+
+## 23. When the room is *not* asked
+
+Two conditions, both necessary:
+
+- **Nobody speaks yet.** If the deterministic pass attributed any line to a
+  character, that speech came from the user's own text and is not ours to
+  rewrite.
+- **The prompt is a brief, not a story** (`BRIEF_MAX_WORDS = 60`). Below that
+  there is no content to lose. Above it the narration *is* the film, and
+  replacing 300 words of someone's story with six invented lines would be
+  rewriting their work rather than finishing it.
+
+This leaves a real gap — a long prose story with no quoted speech still gets no
+dialogue — and it is recorded as one in `roadmap.md` rather than papered over.
+Adding dialogue *alongside* narration is the unresolved design question.
+
+## 24. Determinism, and how to escape it
+
+Every other stage of this pipeline is deterministic, so a re-render must not
+quietly rewrite the film. The model's seed comes from `stable_seed(prompt)`,
+which makes the same prompt produce the same script.
+
+That would make `[r]egenerate` useless, so `Screenwriter.variation` is folded
+into the seed and bumped by the CLI on each pass. Determinism by default,
+variation on request.
+
+## 25. Bugs this surfaced
+
+Three, all pre-existing and all only visible once a brief could produce a real
+film:
+
+- **`Explain photosynthesis…` cast a character called "Explain".** A
+  sentence-opening capital is indistinguishable from a name, and briefs almost
+  always open with an imperative. Worse, the fake cast member made the film look
+  populated and so stopped the room inventing anyone real. Instruction verbs
+  joined `_NON_NAMES`.
+- **`Kestrel Coffee, a small independent roastery` cast "Coffee".** The
+  "Ama, a barista" appositive rule matches a brand name followed by its
+  description exactly as well, and it was clearing the two-capitals entity
+  guard that had been added for precisely this string.
+- **Both roles in a two-hander got the same gender of voice.** Invented names
+  miss the ~130-name table, and model-written descriptions ("the owner, with a
+  kind smile") carry no cue. The cast schema now asks for gender outright, and
+  states it in the *description* rather than a hidden field — `infer_traits`
+  already reads descriptions, and it stays visible and hand-editable in
+  `characters/<id>.md`.
+
+## 26. Measured results (v3)
+
+| measurement | result |
+|---|---|
+| model auto-selected on this machine | `llama3.2:1b` (1.3 GB, Q8_0) |
+| dialogue generation, 6–8 lines | 8–20 s on this Intel Mac CPU |
+| cast invention | ~5 s · location ~3 s |
+| `--doctor --llm` round trip | 4.7 s |
+| brief → film, end to end with `--llm` | ~45 s including render |
+| hosts contacted during generation | `127.0.0.1` only |
+| test suite | 176 (172 fast in ~8 s; 4 slow, one against a real model) |
+
+Verified by reading the output: "Explain photosynthesis to primary school kids"
+now produces Maya and Jax — two invented characters with different voices —
+trading seven lines that actually explain photosynthesis, where the same prompt
+previously produced one narrator reading the instruction back.
+
+## 27. Honest limits (v3)
+
+- **Dialogue quality is the model's ceiling, not the engine's.** `llama3.2:1b`
+  writes serviceable copy and drifts off-brief; it is simply the largest model
+  that answers in seconds on a CPU. `--llm-model` takes anything Ollama has, and
+  a larger model on better hardware is a straight upgrade with no code change.
+- **The room writes one location per film.** Multi-location briefs collapse into
+  a single setting.
+- **Runtime is a target, not a guarantee.** The schema caps the line count, but
+  line *length* is only requested, and shot durations come from measured audio.
+  A 20-second brief lands within a few seconds either way.
+- **`TransformersClient` is still unverified**, for the same reason everything
+  in `visuals/diffusion.py` is.
