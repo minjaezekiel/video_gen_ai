@@ -23,7 +23,7 @@ from .store import CharacterStore, ProductionStore
 from .visuals import BackendRegistry, MockBackend, ProceduralBackend, default_registry
 from .writersroom import WritersRoom
 
-__version__ = "3.1.0"
+__version__ = "3.3.0"
 
 __all__ = [
     "ASPECTS",
