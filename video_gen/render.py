@@ -13,11 +13,14 @@ Two invariants drive the design:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
 import shutil
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,11 +34,18 @@ from moviepy import AudioArrayClip, AudioFileClip, CompositeAudioClip, VideoClip
 import moviepy.audio.fx as afx
 
 from .casting import cast_production, discover_voices
-from .config import CROSSFADE_SECONDS, MIN_SHOT_SECONDS, SHOT_TAIL_PAD, GenerationConfig
-from .model import Line, Production, Shot, stable_seed
+from .config import (
+    CROSSFADE_SECONDS,
+    MAX_AUTO_JOBS,
+    MIN_SHOT_SECONDS,
+    SHOT_TAIL_PAD,
+    GenerationConfig,
+)
+from .model import Line, Production, Shot, character_key, stable_seed
+from . import fastpath, subtitles
 from .music import DEFAULT_MOOD, SAMPLE_RATE, duck, to_stereo
 from .score import ScoreRequest, default_registry as default_music_registry
-from .speech import SpeechSynthesizer
+from .speech import SpeechSynthesizer, read_wav
 from .visuals import CharacterRef, ShotRequest, ShotVisual, character_palette, default_registry
 
 LOGGER = logging.getLogger("video_gen.render")
@@ -62,9 +72,25 @@ class Caption:
 
     start: float
     end: float
-    rgb: np.ndarray
-    alpha: np.ndarray
+    #: (box_h, box_w, 4) uint8. The layer is drawn as RGBA, so keeping it in
+    #: 8-bit is lossless and lets both composite paths share one buffer.
+    rgba: np.ndarray
     box: Tuple[int, int, int, int]
+
+    @property
+    def rgba_bytes(self) -> bytes:
+        return np.ascontiguousarray(self.rgba, dtype=np.uint8).tobytes()
+
+
+@dataclass
+class SpokenLine:
+    """One line's measured place within its shot, for subtitle sidecars."""
+
+    start: float
+    end: float
+    character: str
+    text: str
+    narration: bool
 
 
 @dataclass
@@ -72,9 +98,89 @@ class RenderedShot:
     """A shot reduced to a duration and a function from time to pixels."""
 
     duration: float
-    frame_at: Callable[[float], np.ndarray]
+    #: Time within the shot -> raw RGB bytes at the output resolution.
+    frame_at: Callable[[float], bytes]
     audio: List[Tuple[float, Path]] = field(default_factory=list)  # (offset, wav)
     speech_windows: List[Tuple[float, float]] = field(default_factory=list)
+    #: Per-line spans, in shot-local seconds. Same measured clock as the audio.
+    spoken: List[SpokenLine] = field(default_factory=list)
+
+
+def content_hash(production, config: GenerationConfig) -> str:
+    """Identity of a render: everything that would change a single pixel or sample.
+
+    This is what makes `--resume` honest. Hashing the screenplay file's bytes
+    would be wrong in both directions -- a comment edit would force a re-render,
+    and a changed `--seed` or `--preset` would not. So the hash covers the shot
+    list, the cast's voices, and exactly those config fields the output depends
+    on. `jobs` is absent on purpose: how many threads rendered a film cannot
+    change the film.
+    """
+    parts: List[str] = [
+        production.id,
+        production.title,
+        production.format,
+        production.style,
+        production.aspect,
+        config.preset,
+        # The config's style, not the production's: this is the one the
+        # renderer passes to the backend, and it can be overridden per run.
+        config.style,
+        config.aspect,
+        f"{config.resolution[0]}x{config.resolution[1]}@{config.fps}",
+        f"seed={config.seed}",
+        f"music={int(bool(config.music))}",
+        f"captions={int(bool(config.captions))}",
+        f"labels={int(bool(config.speaker_labels))}",
+        f"lipsync={int(bool(getattr(config, 'lip_sync', False)))}",
+        f"backend={config.backend or 'auto'}",
+        f"music_backend={config.music_backend or 'auto'}",
+        f"volume={config.music_volume:.3f}",
+        f"duck={config.duck_db:.2f}",
+    ]
+    for member in production.cast:
+        voice = member.voice
+        parts.append(
+            f"cast:{member.key}:{voice.voice}:{voice.rate:.4f}:{voice.pitch:.4f}"
+            f":{voice.hosted_voice}:{member.reference_image or ''}"
+        )
+    for scene in production.scenes:
+        parts.append(f"scene:{scene.index}:{scene.setting}:{scene.time_of_day}:{scene.mood}")
+        for shot in scene.shots:
+            # Normalised names, not raw ones: `to_markdown` writes a speaker as
+            # `**MAYA:**`, so hashing `line.character` made the hash change the
+            # first time a screenplay was saved and loaded back -- which meant
+            # --resume never once matched.
+            subjects = ",".join(sorted(character_key(name) for name in shot.subjects))
+            parts.append(
+                f"shot:{shot.index}:{shot.shot_type}:{shot.camera}:{shot.visual}"
+                f":{shot.action}:{subjects}"
+            )
+            for line in shot.lines:
+                parts.append(f"line:{line.key}:{line.delivery}:{line.text}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
+def is_current(production, config: GenerationConfig, output: Path) -> bool:
+    """Whether `output` is already this exact render.
+
+    True only when the file exists and the last recorded render of this
+    production wrote *that* path from identical content. A render of the same
+    production to a different filename does not count.
+    """
+    output = Path(output)
+    if not output.is_file() or output.stat().st_size == 0:
+        return False
+    wanted = content_hash(production, config)
+    for record in reversed(production.renders or []):
+        if record.get("content_hash") != wanted:
+            continue
+        try:
+            if Path(str(record.get("output", ""))).resolve() == output.resolve():
+                return True
+        except OSError:  # noqa: PERF203
+            continue
+    return False
 
 
 def load_font(size: int) -> ImageFont.ImageFont:
@@ -97,11 +203,28 @@ def load_font(size: int) -> ImageFont.ImageFont:
         return ImageFont.load_default()
 
 
+def cover_transform(
+    src_size: Tuple[int, int], size: Tuple[int, int]
+) -> Tuple[float, float, float]:
+    """The ``(scale, left, top)`` that ``cover_resize`` applies.
+
+    Returned separately so a point in the source plate -- a mouth, say -- can be
+    carried into the resized image without guessing at the same arithmetic in
+    two places.
+    """
+    target_w, target_h = size
+    src_w, src_h = src_size
+    scale = max(target_w / src_w, target_h / src_h)
+    resized_w = max(target_w, int(math.ceil(src_w * scale)))
+    resized_h = max(target_h, int(math.ceil(src_h * scale)))
+    return scale, (resized_w - target_w) // 2, (resized_h - target_h) // 2
+
+
 def cover_resize(image: Image.Image, size: Tuple[int, int]) -> Image.Image:
     """Scale to fully cover ``size``, centre-cropping the overflow."""
     target_w, target_h = size
     src_w, src_h = image.size
-    scale = max(target_w / src_w, target_h / src_h)
+    scale, left, top = cover_transform((src_w, src_h), size)
     resized = image.convert("RGB").resize(
         (
             max(target_w, int(math.ceil(src_w * scale))),
@@ -109,9 +232,41 @@ def cover_resize(image: Image.Image, size: Tuple[int, int]) -> Image.Image:
         ),
         Image.LANCZOS,
     )
-    left = (resized.width - target_w) // 2
-    top = (resized.height - target_h) // 2
     return resized.crop((left, top, left + target_w, top + target_h))
+
+
+#: How many mouth openness steps are pre-drawn. Eight is past the point where a
+#: viewer can tell, and it means eight sprites per shot instead of one per frame.
+MOUTH_STEPS = 8
+
+
+def mouth_sprites(width: int, height: int, colour: Tuple[int, int, int]) -> List[bytes]:
+    """RGBA sprites for openness 0..1, pre-drawn once per shot.
+
+    Drawing with Pillow inside the per-frame path would cost more than the
+    resize it sits next to, so the mouth is quantised and the sprites reused.
+    """
+    width = max(2, int(width))
+    height = max(2, int(height))
+    shade = tuple(int(c * 0.30) for c in colour)
+    sprites: List[bytes] = []
+    for step in range(MOUTH_STEPS):
+        openness = step / (MOUTH_STEPS - 1)
+        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer, "RGBA")
+        # A closed mouth is a line; an open one is an ellipse that grows
+        # downwards, which is how a jaw actually moves.
+        lip = max(1.0, height * 0.16)
+        opening = lip + (height - lip) * openness
+        top = (height - opening) / 2
+        inset = width * 0.5 * (1.0 - 0.22 * openness)
+        box = [width / 2 - inset, top, width / 2 + inset, top + opening]
+        draw.ellipse(box, fill=(*shade, 225))
+        if openness > 0.22:
+            # A hint of a lower lip catching the light stops it reading as a hole.
+            draw.arc(box, start=20, end=160, fill=(255, 255, 255, 70), width=max(1, int(lip)))
+        sprites.append(layer.tobytes())
+    return sprites
 
 
 class FilmRenderer:
@@ -137,6 +292,8 @@ class FilmRenderer:
         # the render log records what was used rather than what was asked for.
         self.score_backend = ""
         self.score_detail = ""
+        #: Sidecars written by the last render, recorded into the screenplay.
+        self.subtitle_files: List[Path] = []
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.image_cache_dir = self.config.cache_dir / "images"
@@ -228,8 +385,9 @@ class FilmRenderer:
             draw.text((tx + 2, ty + 2), text_line, font=font, fill=(0, 0, 0, 190))
             draw.text((tx, ty), text_line, font=font, fill=(246, 247, 250, 255))
 
-        arr = np.asarray(layer, dtype=np.float32)
-        return Caption(0.0, 0.0, arr[..., :3], arr[..., 3:4] / 255.0, (x0, y0, box_w, box_h))
+        return Caption(
+            0.0, 0.0, np.asarray(layer, dtype=np.uint8), (x0, y0, box_w, box_h)
+        )
 
     # -- visuals ----------------------------------------------------------- #
 
@@ -304,26 +462,111 @@ class FilmRenderer:
         # Only stills are cached; a frame sequence is large and rarely reused.
         if visual.image is not None and not visual.is_motion:
             try:
-                visual.image.save(cached)
+                # compress_level=1 rather than Pillow's default 6: writing five
+                # 1280x720 PNGs was 6.4s of a 43.8s render, almost all of it
+                # zlib, for a cache file that is read back once and thrown away.
+                # Written beside and renamed so two threads cannot leave a
+                # half-written entry behind.
+                scratch = cached.with_suffix(f".{threading.get_ident():x}.part")
+                visual.image.save(scratch, format="PNG", compress_level=1)
+                scratch.replace(cached)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("could not cache shot image: %s", exc)
         return visual
 
+    def _build_openness(
+        self, audio: Sequence[Tuple[float, Path]], duration: float
+    ) -> Optional[Callable[[float], float]]:
+        """Shot-local time -> mouth openness, from the dialogue actually spoken.
+
+        Built per shot from the synthesised wavs, so a mouth moves with the
+        words rather than on a loop. Silence between lines closes it, which is
+        what makes a shot/reverse-shot pair read correctly.
+        """
+        if not getattr(self.config, "lip_sync", False) or not audio:
+            return None
+
+        fps = float(self.config.fps or 24)
+        frames = max(1, int(math.ceil(duration * fps)) + 1)
+        levels = [0.0] * frames
+        for offset, wav in audio:
+            try:
+                samples, rate = read_wav(Path(wav))
+            except Exception as exc:  # noqa: BLE001 - a missing wav is just silence
+                LOGGER.debug("no lip sync for %s: %s", wav, exc)
+                continue
+            if samples.size == 0 or rate <= 0:
+                continue
+            span = max(1, int(math.ceil(samples.size / rate * fps)))
+            line = fastpath.mouth_openness(samples, rate, fps, span)
+            start = int(round(offset * fps))
+            for i, value in enumerate(line):
+                index = start + i
+                if 0 <= index < frames:
+                    levels[index] = max(levels[index], float(value))
+
+        def openness(t: float) -> float:
+            index = int(t * fps)
+            if index < 0 or index >= frames:
+                return 0.0
+            return levels[index]
+
+        return openness
+
+    def _mouth_plan(
+        self, visual: ShotVisual, big: Tuple[int, int]
+    ) -> List[Tuple[float, float, int, int, List[bytes]]]:
+        """Speaking mouths carried from plate pixels into the zoomed base image.
+
+        Returns `(x, y, w, h, sprites)` per speaking mouth. Empty when lip sync
+        is off, when the backend reported no mouths, or when nobody is speaking
+        -- all of which simply mean the shot renders as it always did.
+        """
+        if not getattr(self.config, "lip_sync", False) or visual.image is None:
+            return []
+        speaking = [m for m in visual.mouths if m.speaking]
+        if not speaking:
+            return []
+
+        scale, left, top = cover_transform(visual.image.size, big)
+        big_w, big_h = big
+        plan: List[Tuple[float, float, int, int, List[bytes]]] = []
+        for mouth in speaking:
+            x = mouth.x * scale - left
+            y = mouth.y * scale - top
+            width = max(2, int(round(mouth.width * scale)))
+            height = max(2, int(round(mouth.height * scale)))
+            if not (0 <= x < big_w and 0 <= y < big_h):
+                continue  # centre-cropped out of the plate
+            plan.append(
+                (x, y, width, height, mouth_sprites(width, height, mouth.colour or (210, 170, 160)))
+            )
+        return plan
+
     def _base_renderer(
-        self, visual: ShotVisual, duration: float, camera: str, seed: int
-    ) -> Callable[[float], np.ndarray]:
-        """Frames from a motion clip, or a camera move over a still."""
+        self,
+        visual: ShotVisual,
+        duration: float,
+        camera: str,
+        seed: int,
+        openness: Optional[Callable[[float], float]] = None,
+    ) -> Callable[[float], bytes]:
+        """Frames from a motion clip, or a camera move over a still.
+
+        Returns raw RGB bytes rather than an array so the per-frame chain --
+        resize, then caption composite -- never converts between the two.
+        """
         out_w, out_h = self.config.resolution
 
         if visual.is_motion and visual.frames:
             frames = [cover_resize(f, (out_w, out_h)) for f in visual.frames]
             rate = visual.frame_rate or self.config.fps
-            arrays = [np.asarray(f, dtype=np.uint8) for f in frames]
+            buffers = [f.convert("RGB").tobytes() for f in frames]
 
-            def from_frames(t: float) -> np.ndarray:
+            def from_frames(t: float) -> bytes:
                 # Hold the last frame if the clip is shorter than the dialogue.
-                index = min(len(arrays) - 1, max(0, int(t * rate)))
-                return arrays[index]
+                index = min(len(buffers) - 1, max(0, int(t * rate)))
+                return buffers[index]
 
             return from_frames
 
@@ -338,8 +581,12 @@ class FilmRenderer:
         )
         p0, p1 = jitter(p0), jitter(p1)
         duration = max(0.1, duration)
+        # Converted once per shot, not once per frame: this is a few megabytes
+        # and the crop is expressed as an offset into it.
+        source = base.convert("RGB").tobytes()
+        mouths = self._mouth_plan(visual, (big_w, big_h)) if openness else []
 
-        def ken_burns(t: float) -> np.ndarray:
+        def ken_burns(t: float) -> bytes:
             u = min(1.0, max(0.0, t / duration))
             eased = u * u * (3.0 - 2.0 * u)  # smoothstep: no jerk at the cuts
             scale = s0 + (s1 - s0) * eased
@@ -349,10 +596,36 @@ class FilmRenderer:
             py = p0[1] + (p1[1] - p0[1]) * eased
             x = int(round(px * (big_w - crop_w)))
             y = int(round(py * (big_h - crop_h)))
-            window = base.resize(
-                (out_w, out_h), Image.BILINEAR, box=(x, y, x + crop_w, y + crop_h)
+            frame = fastpath.resize_crop(
+                source, big_w, big_h, x, y, crop_w, crop_h, out_w, out_h
             )
-            return np.asarray(window, dtype=np.uint8)
+            if not mouths:
+                return frame
+
+            # The crop also scales, so a mouth's size on screen changes as the
+            # camera pushes in. Recomputed per frame from the same crop the
+            # picture used, which is why this lives inside the closure.
+            level = openness(t)
+            if level <= 0.02:
+                return frame
+            step = min(MOUTH_STEPS - 1, max(0, int(round(level * (MOUTH_STEPS - 1)))))
+            fx, fy = out_w / crop_w, out_h / crop_h
+            for mx, my, mw, mh, sprites in mouths:
+                sw = max(2, int(round(mw * fx)))
+                sh = max(2, int(round(mh * fy)))
+                cx = int(round((mx - x) * fx)) - sw // 2
+                cy = int(round((my - y) * fy)) - sh // 2
+                if cx < 0 or cy < 0 or cx + sw > out_w or cy + sh > out_h:
+                    continue  # the mouth has panned out of frame
+                sprite = sprites[step]
+                if (sw, sh) != (mw, mh):
+                    sprite = (
+                        Image.frombuffer("RGBA", (mw, mh), sprite, "raw", "RGBA", 0, 1)
+                        .resize((sw, sh), Image.BILINEAR)
+                        .tobytes()
+                    )
+                frame = fastpath.blend_box(frame, out_w, out_h, cx, cy, sw, sh, sprite)
+            return frame
 
         return ken_burns
 
@@ -363,6 +636,7 @@ class FilmRenderer:
         audio: List[Tuple[float, Path]] = []
         captions: List[Caption] = []
         windows: List[Tuple[float, float]] = []
+        spoken: List[SpokenLine] = []
         cursor = 0.0
 
         for line_number, line in enumerate(shot.lines):
@@ -373,10 +647,13 @@ class FilmRenderer:
                 from .model import VoiceProfile
 
                 voice = VoiceProfile()
-            _, spoken = self.speech.speak(line.text, voice, wav)
+            _, said = self.speech.speak(line.text, voice, wav)
 
             audio.append((cursor, wav))
-            windows.append((cursor, cursor + spoken))
+            windows.append((cursor, cursor + said))
+            spoken.append(
+                SpokenLine(cursor, cursor + said, line.character, line.text, line.is_narration)
+            )
             colour = (
                 tuple(member.palette)
                 if member and member.palette
@@ -386,31 +663,41 @@ class FilmRenderer:
             if caption is not None and self.config.captions:
                 caption.start = cursor
                 # Hold the subtitle slightly past the audio so it is readable.
-                caption.end = cursor + spoken + 0.35
+                caption.end = cursor + said + 0.35
                 captions.append(caption)
-            cursor += spoken + 0.12  # a beat between lines
+            cursor += said + 0.12  # a beat between lines
 
         duration = max(MIN_SHOT_SECONDS, cursor + SHOT_TAIL_PAD if shot.lines else shot.duration)
         shot.duration = round(duration, 2)
 
         visual = self.shot_visual(production, shot, duration)
-        base_at = self._base_renderer(visual, duration, shot.camera, seed=self.config.seed + index)
+        base_at = self._base_renderer(
+            visual,
+            duration,
+            shot.camera,
+            seed=self.config.seed + index,
+            openness=self._build_openness(audio, duration),
+        )
 
-        def frame_at(t: float) -> np.ndarray:
+        out_w, out_h = self.config.resolution
+        overlays = {id(c): c.rgba_bytes for c in captions}
+
+        def frame_at(t: float) -> bytes:
             frame = base_at(t)
             active = next((c for c in captions if c.start <= t < c.end), None)
             if active is None:
                 return frame
-            frame = frame.copy()
             x0, y0, box_w, box_h = active.box
-            region = frame[y0 : y0 + box_h, x0 : x0 + box_w].astype(np.float32)
-            frame[y0 : y0 + box_h, x0 : x0 + box_w] = (
-                region * (1.0 - active.alpha) + active.rgb * active.alpha
-            ).astype(np.uint8)
-            return frame
+            return fastpath.blend_box(
+                frame, out_w, out_h, x0, y0, box_w, box_h, overlays[id(active)]
+            )
 
         return RenderedShot(
-            duration=duration, frame_at=frame_at, audio=audio, speech_windows=windows
+            duration=duration,
+            frame_at=frame_at,
+            audio=audio,
+            speech_windows=windows,
+            spoken=spoken,
         )
 
     # -- timeline ---------------------------------------------------------- #
@@ -444,6 +731,11 @@ class FilmRenderer:
         total = starts[-1] + durations[-1]
         last = len(shots) - 1
 
+        out_w, out_h = self.config.resolution
+
+        def as_array(buffer: bytes) -> np.ndarray:
+            return np.frombuffer(buffer, dtype=np.uint8).reshape(out_h, out_w, 3)
+
         def frame_function(t: float) -> np.ndarray:
             index = 0
             for i, start in enumerate(starts):
@@ -452,10 +744,10 @@ class FilmRenderer:
                 else:
                     break
             index = min(index, last)
-            frame = shots[index].frame_at(t - starts[index])
+            frame = as_array(shots[index].frame_at(t - starts[index]))
             if fade > 0 and index > 0 and t < starts[index - 1] + durations[index - 1]:
                 alpha = min(1.0, max(0.0, (t - starts[index]) / fade))
-                previous = shots[index - 1].frame_at(t - starts[index - 1])
+                previous = as_array(shots[index - 1].frame_at(t - starts[index - 1]))
                 frame = (
                     previous.astype(np.float32) * (1.0 - alpha)
                     + frame.astype(np.float32) * alpha
@@ -528,6 +820,99 @@ class FilmRenderer:
 
         return CompositeAudioClip(tracks).with_duration(total), clips
 
+    # -- subtitles --------------------------------------------------------- #
+
+    def _write_subtitles(
+        self, rendered: Sequence[RenderedShot], starts: Sequence[float], output: Path
+    ) -> List[Path]:
+        """Sidecars from the measured per-line timings, offset onto the timeline."""
+        if not getattr(self.config, "subtitles", True):
+            return []
+        spans: List[Tuple[float, float, str, str, bool]] = []
+        for shot, start in zip(rendered, starts):
+            for line in shot.spoken:
+                spans.append(
+                    (
+                        start + line.start,
+                        start + line.end,
+                        line.character,
+                        line.text,
+                        line.narration,
+                    )
+                )
+        cues = subtitles.build_cues(spans)
+        if not cues:
+            return []
+        try:
+            return subtitles.write_sidecars(
+                output, cues, speaker_labels=self.config.speaker_labels
+            )
+        except OSError as exc:
+            LOGGER.warning("could not write subtitle sidecars: %s", exc)
+            return []
+
+    # -- shot scheduling --------------------------------------------------- #
+
+    def worker_count(self, shots: int) -> int:
+        """How many shots to render at once.
+
+        Shots are independent: each synthesises its own dialogue and asks the
+        backend for its own picture. Most of a shot is spent blocked on a TTS
+        subprocess or inside Pillow, both of which release the GIL, so threads
+        genuinely overlap -- TTS alone was 25% of a measured render, serialised.
+
+        Clamped to 1 when the visual backend holds one model on one device,
+        because concurrent calls would interleave on the same weights.
+        """
+        if shots <= 1:
+            return 1
+        if not getattr(self.backend, "parallel_safe", False):
+            return 1
+        requested = int(getattr(self.config, "jobs", 0) or 0)
+        if requested > 0:
+            return min(requested, shots)
+        return max(1, min(shots, os.cpu_count() or 1, MAX_AUTO_JOBS))
+
+    def _render_shots(
+        self, production: Production, shots: Sequence[Shot]
+    ) -> Tuple[List[RenderedShot], List[float]]:
+        """Render every shot, in order, possibly several at a time."""
+        total = len(shots)
+        workers = self.worker_count(total)
+        rendered: List[Optional[RenderedShot]] = [None] * total
+        per_shot: List[float] = [0.0] * total
+        done = 0
+        guard = threading.Lock()
+
+        def one(index: int) -> None:
+            nonlocal done
+            shot_started = time.time()
+            rendered[index] = self.render_shot(production, shots[index], index)
+            per_shot[index] = round(time.time() - shot_started, 2)
+            with guard:
+                done += 1
+                # Reported on completion rather than on start, so the
+                # percentage still only moves forwards when shots overlap.
+                self.progress(
+                    done / total * 90.0,
+                    f"Shot {done}/{total} ({shots[index].shot_type})",
+                )
+
+        if workers == 1:
+            for index in range(total):
+                one(index)
+        else:
+            LOGGER.debug("rendering %d shots across %d workers", total, workers)
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="shot") as pool:
+                # list() so the first exception propagates rather than being
+                # swallowed with a half-filled shot list.
+                list(pool.map(one, range(total)))
+
+        missing = [i for i, value in enumerate(rendered) if value is None]
+        if missing:
+            raise RuntimeError(f"shots {missing} did not render")
+        return [r for r in rendered if r is not None], per_shot
+
     # -- render ------------------------------------------------------------ #
 
     def render(self, production: Production, output: Optional[Path] = None) -> Path:
@@ -555,20 +940,11 @@ class FilmRenderer:
             )
 
         started = time.time()
-        per_shot: List[float] = []
-        rendered: List[RenderedShot] = []
         audio_clips: List[AudioFileClip] = []
         total_shots = len(shots)
 
         try:
-            for index, shot in enumerate(shots):
-                shot_started = time.time()
-                self.progress(
-                    index / total_shots * 90.0,
-                    f"Shot {index + 1}/{total_shots} ({shot.shot_type})",
-                )
-                rendered.append(self.render_shot(production, shot, index))
-                per_shot.append(round(time.time() - shot_started, 2))
+            rendered, per_shot = self._render_shots(production, shots)
 
             self.progress(92.0, "Assembling timeline")
             durations = [r.duration for r in rendered]
@@ -582,6 +958,10 @@ class FilmRenderer:
 
             self.progress(95.0, "Encoding")
             self._encode(video, output)
+
+            # After encoding, so a failed render never leaves orphan sidecars
+            # claiming to describe a file that does not exist.
+            self.subtitle_files = self._write_subtitles(rendered, starts, output)
         finally:
             for clip in audio_clips:
                 try:
@@ -621,6 +1001,11 @@ class FilmRenderer:
             "per_shot_s": per_shot,
             "cast": {c.name: c.voice.voice for c in production.speaking_cast},
         }
+        record["content_hash"] = content_hash(production, self.config)
+        if self.subtitle_files:
+            record["subtitles"] = [str(path) for path in self.subtitle_files]
+        if self.speech.cache_hits:
+            record["audio_cache_hits"] = self.speech.cache_hits
         if self.score_backend:
             record["score_backend"] = self.score_backend
         if getattr(self.speech, "engine_name", ""):

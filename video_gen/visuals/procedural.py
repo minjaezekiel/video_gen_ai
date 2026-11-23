@@ -15,7 +15,7 @@ from typing import List, Optional, Sequence, Set, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
-from .base import IDENTITY, STILL, CharacterRef, ShotRequest, ShotVisual
+from .base import IDENTITY, STILL, CharacterRef, MouthAnchor, ShotRequest, ShotVisual
 
 # Shot type -> (figure height as a fraction of frame height, vertical anchor).
 _STAGING = {
@@ -149,6 +149,50 @@ def _draw_figure(
     )
 
 
+def figure_layout(
+    size: Tuple[int, int],
+    characters: Sequence[CharacterRef],
+    shot_type: str,
+    seed: int = 0,
+) -> List[MouthAnchor]:
+    """Where each visible figure's mouth lands, in plate pixels.
+
+    Separated out so the renderer can animate a mouth without re-staging the
+    whole plate: the geometry here is the single source of truth for both, so a
+    mouth cannot drift away from the face it belongs to.
+    """
+    visible = [c for c in characters if c.name]
+    scale, anchor = _STAGING.get(shot_type, _STAGING["medium"])
+    if not visible or scale <= 0:
+        return []
+
+    width, height = size
+    figure_h = height * scale
+    baseline = height * anchor
+    head_r = figure_h * 0.075
+    head_cy = baseline - figure_h + head_r
+
+    anchors: List[MouthAnchor] = []
+    count = len(visible)
+    for index, character in enumerate(visible):
+        fraction = (index + 1) / (count + 1)
+        jitter = ((seed + index * 37) % 11 - 5) / 100.0
+        centre_x = width * (fraction + jitter * 0.4)
+        anchors.append(
+            MouthAnchor(
+                name=character.name,
+                speaking=bool(character.speaking),
+                # Mouths sit low on the face, a little under the centre.
+                x=centre_x,
+                y=head_cy + head_r * 0.34,
+                width=head_r * 0.80,
+                height=head_r * 0.52,
+                colour=character.palette or character_palette(character.name, seed),
+            )
+        )
+    return anchors
+
+
 def stage_characters(
     plate: Image.Image,
     characters: Sequence[CharacterRef],
@@ -166,15 +210,9 @@ def stage_characters(
     figure_h = height * scale
     baseline = height * anchor
 
-    # Spread evenly, with a gentle deterministic jitter so a two-hander is not
-    # perfectly symmetrical.
-    count = len(visible)
-    for index, character in enumerate(visible):
-        fraction = (index + 1) / (count + 1)
-        jitter = ((seed + index * 37) % 11 - 5) / 100.0
-        centre_x = width * (fraction + jitter * 0.4)
-        colour = character.palette or character_palette(character.name, seed)
-        _draw_figure(layer, centre_x, baseline, figure_h, colour, character.speaking)
+    for spot in figure_layout((width, height), characters, shot_type, seed):
+        colour = spot.colour
+        _draw_figure(layer, spot.x, baseline, figure_h, colour, spot.speaking)
 
     blurred = layer.filter(ImageFilter.GaussianBlur(radius=max(0.6, height / 900.0)))
     return Image.alpha_composite(plate.convert("RGBA"), blurred).convert("RGB")
@@ -185,6 +223,9 @@ class ProceduralBackend:
 
     name = "procedural"
     priority = 10
+    #: Each call draws into its own new image with a locally seeded RNG,
+    #: so shots can be rendered concurrently.
+    parallel_safe = True
 
     def __init__(self, config=None) -> None:
         self.config = config
@@ -225,4 +266,11 @@ class ProceduralBackend:
         used = {STILL}
         if request.characters:
             used.add(IDENTITY)
-        return ShotVisual(backend=self.name, image=staged, used=used)
+        return ShotVisual(
+            backend=self.name,
+            image=staged,
+            used=used,
+            # The renderer animates these from the measured audio; the geometry
+            # comes from the same function that staged the figures.
+            mouths=figure_layout(size, request.characters, request.shot_type, seed=request.seed),
+        )

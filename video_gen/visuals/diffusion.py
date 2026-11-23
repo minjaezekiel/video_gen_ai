@@ -69,6 +69,10 @@ class DiffusionBackend:
 
     name = "diffusion"
     priority = 100
+    #: One pipeline on one device. Concurrent calls would interleave on
+    #: the same weights and the same VRAM, so the renderer keeps shots
+    #: serial when this backend is selected.
+    parallel_safe = False
 
     def __init__(self, config=None, enable_motion: bool = True) -> None:
         self.config = config

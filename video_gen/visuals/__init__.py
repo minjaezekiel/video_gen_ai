@@ -8,13 +8,20 @@ from .base import (
     TRAIN,
     BackendRegistry,
     CharacterRef,
+    MouthAnchor,
     ShotRequest,
     ShotVisual,
     VisualBackend,
     default_registry,
 )
 from .mock import MockBackend
-from .procedural import ProceduralBackend, character_palette, render_environment, stage_characters
+from .procedural import (
+    ProceduralBackend,
+    character_palette,
+    figure_layout,
+    render_environment,
+    stage_characters,
+)
 
 __all__ = [
     "ALL_CAPABILITIES",
@@ -24,6 +31,7 @@ __all__ = [
     "TRAIN",
     "BackendRegistry",
     "CharacterRef",
+    "MouthAnchor",
     "MockBackend",
     "ProceduralBackend",
     "ShotRequest",
@@ -31,6 +39,7 @@ __all__ = [
     "VisualBackend",
     "character_palette",
     "default_registry",
+    "figure_layout",
     "render_environment",
     "stage_characters",
 ]

@@ -22,6 +22,7 @@ class MockBackend:
 
     name = "mock"
     priority = 5
+    parallel_safe = True
 
     def __init__(
         self,

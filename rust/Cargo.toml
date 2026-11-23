@@ -1,0 +1,20 @@
+[package]
+name = "video_gen_core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Optional native accelerator for video_gen_ai's per-frame hot loops"
+repository = "https://github.com/minjaezekiel/video_gen_ai"
+
+[lib]
+name = "video_gen_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

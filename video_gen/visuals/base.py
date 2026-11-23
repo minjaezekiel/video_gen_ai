@@ -76,6 +76,24 @@ class ShotRequest:
 
 
 @dataclass
+class MouthAnchor:
+    """Where a staged figure's mouth is, in the plate's own pixels.
+
+    A backend that stages recognisable faces can report these so the renderer
+    animates them from the measured audio. Reporting none simply means no lip
+    sync for that shot, which is what every model-backed backend does today.
+    """
+
+    name: str
+    x: float
+    y: float
+    width: float
+    height: float
+    speaking: bool = False
+    colour: Optional[Tuple[int, int, int]] = None
+
+
+@dataclass
 class ShotVisual:
     """What a backend produced: a still, or a sequence of frames."""
 
@@ -84,6 +102,8 @@ class ShotVisual:
     frames: Optional[List[Image.Image]] = None
     frame_rate: float = 0.0
     used: Set[str] = field(default_factory=set)
+    #: Mouth positions in `image` pixel space, when the backend knows them.
+    mouths: List[MouthAnchor] = field(default_factory=list)
 
     @property
     def is_motion(self) -> bool:
@@ -100,6 +120,9 @@ class VisualBackend(Protocol):
 
     name: str
     priority: int
+    #: Whether `render` may be called from several threads at once. False for
+    #: anything holding one model on one device.
+    parallel_safe: bool
 
     def available(self) -> bool:
         """Whether this backend can run here, right now."""

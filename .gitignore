@@ -12,6 +12,9 @@ __pycache__/
 build/
 dist/
 
+# rust
+rust/target/
+
 # generated artefacts
 output/
 .cache/

@@ -176,6 +176,11 @@ SHOT_TYPES: Dict[str, Dict[str, object]] = {
 
 CAMERA_MOVES = ("static", "push in", "pull out", "pan left", "pan right", "tilt up")
 
+#: Ceiling on automatically chosen shot workers. Past a handful, shots stop
+#: being the bottleneck -- ffmpeg is still fed one frame at a time -- and the
+#: memory for several decoded base images at once starts to matter.
+MAX_AUTO_JOBS = 8
+
 MIN_SHOT_SECONDS = 1.6
 MAX_SHOT_SECONDS = 12.0
 SHOT_TAIL_PAD = 0.45
@@ -202,10 +207,18 @@ class GenerationConfig:
     duck_db: float = -11.0  # how far the bed drops under dialogue
     captions: bool = True
     speaker_labels: bool = True
+    #: Write .srt and .vtt sidecars beside the rendered film.
+    subtitles: bool = True
+    #: Audio-driven mouth movement on backends that report where mouths are.
+    #: Only the procedural tier does, so this is a no-op with a model backend.
+    lip_sync: bool = True
     use_llm: bool = False
     llm_model: str = ""  # name a local model, else the best small one is chosen
     backend: Optional[str] = None  # force one visual backend, else auto-detect
     music_backend: Optional[str] = None  # force one music backend, else auto-detect
+    #: Shots rendered at once. 0 = choose from the CPU count, 1 = serial.
+    #: Forced to 1 when the visual backend is not safe to call concurrently.
+    jobs: int = 0
     #: Path to a providers.yaml. None means "look in the usual places"; every
     #: hosted tier stays off unless one of them switches it on.
     providers_file: Optional[Path] = None
@@ -255,6 +268,19 @@ class GenerationConfig:
         else:
             width, height = short, int(round(short / ratio))
         return (width + (width % 2), height + (height % 2))
+
+    def worker_hint(self) -> int:
+        """How many shots would render at once, for `--doctor` to report.
+
+        The renderer makes the real decision, because it also knows whether the
+        chosen visual backend is safe to call concurrently. This is the ceiling
+        that choice starts from.
+        """
+        import os
+
+        if self.jobs > 0:
+            return self.jobs
+        return max(1, min(os.cpu_count() or 1, MAX_AUTO_JOBS))
 
     @property
     def providers(self):

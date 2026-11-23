@@ -8,8 +8,11 @@ pipeline drift out of sync.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import shutil
 import subprocess
+import threading
 import wave
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -119,6 +122,67 @@ class SpeechSynthesizer:
         self.engine_name = ""
         self._hosted = None
         self._hosted_failed = False
+        # Shots can render in parallel, so the counters and the failure list are
+        # shared mutable state. A film reporting the wrong number of silent
+        # lines is worse than useless: that count is what exit code 2 rests on.
+        self._lock = threading.Lock()
+        self.cache_hits = 0
+
+    # -- cache ------------------------------------------------------------- #
+
+    @property
+    def cache_dir(self) -> Optional[Path]:
+        """Where synthesised lines are kept between renders, if anywhere.
+
+        Re-rendering an edited screenplay re-speaks every unchanged line
+        otherwise, and TTS was 25% of a measured render -- the single largest
+        cost after encoding.
+        """
+        root = getattr(self.config, "cache_dir", None)
+        if root is None:
+            return None
+        try:
+            directory = Path(root) / "audio"
+            directory.mkdir(parents=True, exist_ok=True)
+            return directory
+        except OSError as exc:  # noqa: PERF203 - an unwritable cache is not fatal
+            LOGGER.debug("no audio cache: %s", exc)
+            return None
+
+    @property
+    def engine_tag(self) -> str:
+        """A stable name for the engine this synthesiser prefers.
+
+        Derived from configuration only, never from what has already been
+        tried. `_neural_failed` flips the first time a neural attempt fails, so
+        including it meant a line was looked up under one key and stored under
+        another -- a cache that could never hit on a later run.
+
+        A line cached when neural TTS worked and read back when it does not is
+        still correct audio for that text and voice, which is why the preferred
+        engine is a good enough tag and the realised one is not needed.
+        """
+        if self.hosted is not None:
+            return f"hosted:{self.hosted.name}"
+        if self.allow_neural:
+            return "neural"
+        return f"system:{self.command or 'none'}"
+
+    def cache_key(self, text: str, voice: VoiceProfile) -> str:
+        """Identity of a spoken line: the text and everything shaping it."""
+        blob = "|".join(
+            [
+                " ".join(str(text).split()),
+                voice.engine,
+                voice.voice,
+                f"{voice.rate:.4f}",
+                f"{voice.pitch:.4f}",
+                voice.hosted_voice,
+                self.command or "",
+                self.engine_tag,
+            ]
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:20]
 
     # -- hosted (opt-in, paid) --------------------------------------------- #
 
@@ -292,7 +356,8 @@ class SpeechSynthesizer:
             # One failure disables the tier for the rest of the render: paying
             # for a provider that is down, once per line, is worse than
             # finishing the film with system voices.
-            self._hosted_failed = True
+            with self._lock:
+                self._hosted_failed = True
             return None
 
     # -- public ------------------------------------------------------------ #
@@ -303,17 +368,72 @@ class SpeechSynthesizer:
         if not text:
             return self.silence(out_path, MIN_LINE_SECONDS)
 
+        cached = self._from_cache(text, voice, out_path)
+        if cached is not None:
+            return cached
+
+        result = self._synthesise(text, voice, out_path)
+        self._to_cache(text, voice, result[0])
+        return result
+
+    # -- cache plumbing ---------------------------------------------------- #
+
+    def _from_cache(
+        self, text: str, voice: VoiceProfile, out_path: Path
+    ) -> Optional[Tuple[Path, float]]:
+        directory = self.cache_dir
+        if directory is None:
+            return None
+        entry = directory / f"{self.cache_key(text, voice)}.wav"
+        if not entry.is_file():
+            return None
+        try:
+            samples, rate = read_wav(entry)
+            if samples.size < 8 or rate <= 0:
+                raise ValueError("cached line is empty")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(entry, out_path)
+        except Exception as exc:  # noqa: BLE001 - a bad entry just means re-speaking
+            LOGGER.debug("ignoring unusable cached line %s: %s", entry, exc)
+            entry.unlink(missing_ok=True)
+            return None
+        with self._lock:
+            self.voiced_lines += 1
+            self.cache_hits += 1
+            self.engine_name = self.engine_name or "cache"
+        return out_path, samples.size / rate
+
+    def _to_cache(self, text: str, voice: VoiceProfile, produced: Path) -> None:
+        directory = self.cache_dir
+        if directory is None or not Path(produced).is_file():
+            return
+        entry = directory / f"{self.cache_key(text, voice)}.wav"
+        if entry.exists():
+            return
+        try:
+            # Written beside, then renamed: two shots speaking in parallel must
+            # never leave a half-written entry for the next render to read.
+            scratch = entry.with_suffix(f".{threading.get_ident():x}.part")
+            shutil.copyfile(produced, scratch)
+            scratch.replace(entry)
+        except Exception as exc:  # noqa: BLE001 - caching is an optimisation
+            LOGGER.debug("could not cache a spoken line: %s", exc)
+
+    def _synthesise(self, text: str, voice: VoiceProfile, out_path: Path) -> Tuple[Path, float]:
+        """The fallback chain, with no cache in the way."""
         if self.hosted is not None:
             result = self._speak_hosted(text, voice, out_path)
             if result is not None:
-                self.voiced_lines += 1
+                with self._lock:
+                    self.voiced_lines += 1
                 return result
 
         if self.allow_neural:
             result = self._speak_neural(text, voice, out_path)
             if result is not None:
-                self.voiced_lines += 1
-                self.engine_name = self.engine_name or "neural"
+                with self._lock:
+                    self.voiced_lines += 1
+                    self.engine_name = self.engine_name or "neural"
                 return result
         # A stored profile can say "silent" because discovery failed once on
         # some other machine. If a synthesiser exists now, use it anyway rather
@@ -321,15 +441,22 @@ class SpeechSynthesizer:
         if self.command is not None:
             result = self._speak_system(text, voice, out_path)
             if result is not None:
-                self.voiced_lines += 1
-                self.engine_name = self.engine_name or self.command
+                with self._lock:
+                    self.voiced_lines += 1
+                    self.engine_name = self.engine_name or self.command
                 return result
-            self.failures.append(f"{voice.voice or 'default voice'}: {self.command} produced nothing")
-        elif not self.failures:
-            self.failures.append("no speech synthesiser found on this system")
+            with self._lock:
+                self.failures.append(
+                    f"{voice.voice or 'default voice'}: {self.command} produced nothing"
+                )
+        else:
+            with self._lock:
+                if not self.failures:
+                    self.failures.append("no speech synthesiser found on this system")
 
         # Silence paced like speech keeps captions readable with no synthesiser.
-        self.silent_lines += 1
+        with self._lock:
+            self.silent_lines += 1
         words = max(1, len(text.split()))
         return self.silence(out_path, max(MIN_LINE_SECONDS, words / 150.0 * 60.0))
 
