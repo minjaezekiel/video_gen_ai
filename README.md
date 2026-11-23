@@ -24,8 +24,11 @@ no GPU required.
 - [What it has](#what-it-has) — features and where they live
 - [How to use it](#how-to-use-it) — commands, flags, input formats
 - [Writing dialogue with a local LLM](#writing-dialogue-with-a-local-llm)
+- [Driving it from an agent](#driving-it-from-an-agent) — `--json`, exit codes
 - [Characters and voices](#characters-and-voices)
 - [Screenplays on disk](#screenplays-on-disk)
+- [Hosted providers](#hosted-providers) — opt-in, paid, off by default
+- [Linux and containers](#linux-and-containers)
 - [What runs where](#what-runs-where) · [Troubleshooting](#troubleshooting)
 - [Honest limits](#honest-limits)
 
@@ -36,11 +39,21 @@ no GPU required.
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e .                   # or: pip install -r requirements.txt
 ```
 
 That is everything. No system ffmpeg (it ships with `imageio-ffmpeg`), no models
-to download.
+to download. Seven runtime dependencies, all of them imported.
+
+Installing puts `video-gen` on your PATH; `python -m video_gen` is identical and
+needs no install at all.
+
+**On Linux, also install a speech synthesiser** or every character will be
+silent — see [Linux and containers](#linux-and-containers).
+
+```bash
+apt-get install -y espeak-ng
+```
 
 ```bash
 python -m video_gen --doctor       # what can this machine do? does audio work?
@@ -91,7 +104,13 @@ python -m video_gen "Ama, a barista, tells a tired commuter named Dev
 
 # Feed it a real screenplay
 python -m video_gen --prompt-file script.txt --style 3d
+
+# Machine-readable, never interactive
+python -m video_gen --prompt "a 30s advert for a bike shop" --json
 ```
+
+[`examples/`](examples/) has a runnable, verified example of each input shape,
+plus the full agent loop.
 
 ---
 
@@ -121,6 +140,10 @@ python -m video_gen --prompt-file script.txt --style 3d
    ┌───────▼────────┐   per shot: synthesise each line, ask a visual
    │    RENDERER    │   backend for the picture, build captions
    └───────┬────────┘   (render.py)
+           │
+   ┌───────▼────────┐   procedural pads per scene mood, or a hosted
+   │     SCORE      │   model if one is switched on  (score/)
+   └───────┬────────┘
            │
    ┌───────▼────────┐   one VideoClip, hand-rolled crossfades,
    │    TIMELINE    │   dialogue pinned to its own shot, score ducked
@@ -161,6 +184,15 @@ capabilities — `still`, `identity`, `motion`, `train` — and the renderer ask
 what it wants and copes with what it gets. A machine that can make stills but not
 motion still produces a finished film; it just uses camera moves instead.
 
+**So does the score.** `MusicBackend` mirrors it: `procedural` always works,
+`hosted` wins when you switch it on, and the registry takes a *chain* rather
+than one backend. A paid provider that times out, rate-limits or runs out of
+credit costs fidelity and never the film.
+
+**A silent film is a failure, and says so.** Captions over silence looks
+finished and is completely broken, so it exits **2** rather than 0. That is the
+one failure a caller cannot detect by checking whether a file appeared.
+
 ---
 
 ## What it has
@@ -170,7 +202,7 @@ motion still produces a finished film; it just uses camera moves instead.
 | **Interview** | 8 questions, every default inferred from your prompt |
 | **Three input formats** | screenplay, prose story, or a one-line brief |
 | **Cast + shot list** | scenes, shot types, camera moves, attributed dialogue |
-| **A voice per character** | 26 castable voices on macOS, matched by gender/age/accent |
+| **A voice per character** | 26 castable voices on macOS, up to 36 on Linux, matched by gender/age/accent |
 | **Speaker-labelled captions** | each name in that character's own colour |
 | **Score with ducking** | per-scene mood, crossfaded cues, −11 dB under speech |
 | **Formats** | ad · short film · educational · explainer |
@@ -179,7 +211,9 @@ motion still produces a finished film; it just uses camera moves instead.
 | **Character library** | reusable across productions, with your own reference art |
 | **Written dialogue** | optional local LLM invents a cast and writes their lines |
 | **Render history** | every render appends real timings to the screenplay |
-| **176 tests** | all offline, ~8s |
+| **An agent interface** | `--json` on every command, documented exit codes |
+| **Hosted providers** | opt-in, paid score and voices; off by default, always falls back |
+| **293 tests** | 265 offline unit tests in ~13s; 28 live renders and CLI round trips |
 
 Shot types (`establishing`, `wide`, `medium`, `close`, `insert`) drive both the
 image prompt and how large characters are staged, so framing genuinely changes
@@ -199,11 +233,15 @@ python -m video_gen --characters       # your cast library
 python -m video_gen --cast <id>        # re-roll the voices for a production
 python -m video_gen --doctor           # capabilities + a real audio probe
 python -m video_gen --doctor --llm     # ...and a real dialogue probe
+python -m video_gen --show <id>        # print a saved screenplay
+python -m video_gen --providers        # opt-in hosted providers and their status
+python -m video_gen --init-providers   # write a providers.yaml (all tiers off)
 python -m video_gen --self-test        # offline end-to-end check
+python -m video_gen --version
 ```
 
-`python video_generator.py` also works — it is a shim over the `video_gen`
-package.
+`video-gen` is the same thing once installed, and `python video_generator.py`
+also works — it is a shim over the `video_gen` package.
 
 ### Flags
 
@@ -216,7 +254,13 @@ package.
 | `--seconds N` | target length |
 | `--seed N` | reproducible visuals, palette and staging |
 | `--title`, `--output` | name the film and the file |
+| `--prompt TEXT` | the prompt, if you would rather not use the positional |
+| `--prompt-file PATH` | read the prompt from a file |
 | `--backend NAME` | force a visual backend (see `--doctor`) |
+| `--music-backend NAME` | force a music backend (see `--doctor`) |
+| `--no-render` | write the screenplay and stop |
+| `--json` | one JSON object on stdout; implies `--yes` |
+| `--providers-file PATH` | use a specific providers config |
 | `--no-music`, `--no-captions` | drop the score / burned-in subtitles |
 | `--llm` | let a local LLM write dialogue and image prompts |
 | `--llm-model NAME` | pick the model, e.g. `llama3.2:1b` (implies `--llm`) |
@@ -322,6 +366,106 @@ straight upgrade with no code change.
 
 ---
 
+## Driving it from an agent
+
+Pass `--json` to any command. One JSON object goes to stdout, every human line
+goes to stderr, and nothing is ever interactive — `--json` implies `--yes`, so a
+caller cannot be left waiting at a prompt.
+
+```bash
+python -m video_gen --doctor --json
+python -m video_gen --prompt "a 30s advert for a bike shop" --json --output ad.mp4
+python -m video_gen --show <id> --json
+```
+
+[`SKILL.md`](SKILL.md) is the packaged version of this section, and
+[`examples/agent_workflow.py`](examples/agent_workflow.py) is a working
+implementation of the whole loop.
+
+### Ask what the machine can do first
+
+```bash
+python -m video_gen --doctor --json
+```
+
+```json
+{
+  "capabilities": {
+    "render": true,
+    "speech": true,
+    "write_dialogue": true,
+    "hosted_music": false,
+    "hosted_speech": false
+  },
+  "voices": { "castable": 26, "accents": ["AU", "GB", "IE", "IN", "US", "ZA"] },
+  "formats": ["ad", "educational", "explainer", "short"],
+  "aspects": ["16:9", "1:1", "21:9", "4:5", "9:16"]
+}
+```
+
+It probes rather than guesses: `speech` means a real phrase was synthesised and
+measured, and `write_dialogue` with `--llm` means a real line came back usable.
+`formats`, `styles`, `aspects` and `presets` are the exact vocabulary the flags
+accept, so a command can be built without hardcoding it.
+
+### Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | ok |
+| 1 | usage — no prompt, unknown id, unreadable file |
+| 2 | **an MP4 exists but no line was audible** |
+| 3 | render failed, no file |
+| 4 | cancelled at a prompt (not reachable under `--json`) |
+
+Code 2 is the one that matters. The file is the right length, has real burned-in
+subtitles and plays silence — so a caller that only checks whether a file
+appeared will hand over a broken video. It happens when there is no speech
+synthesiser, which on Linux is the default state until `espeak-ng` is installed.
+
+### The envelope
+
+Every payload carries the same six keys, so a caller never has to guess:
+
+```json
+{
+  "schema": 1,
+  "command": "create",
+  "ok": true,
+  "exit_code": 0,
+  "status": "ok",
+  "error": null
+}
+```
+
+`schema` is `1`. New keys get added without bumping it; a key only changes
+meaning or disappears on a bump. `status` is always the command's outcome — a
+production's own draft/accepted/rendered state is `production_status`, because
+one key cannot mean two things.
+
+A render adds `output`, `duration_s`, `elapsed_s`, `shots`, `voiced_lines`,
+`silent_lines`, `screenplay`, `resolution`, the `cast` with each voice, and which
+`visual_backend`, `score_backend` and `speech_engine` were actually used. Paths
+are absolute strings.
+
+### A loop worth copying
+
+```bash
+# 1. plan, and stop before spending time on a render
+python -m video_gen --prompt-file brief.txt --no-render --json
+
+# 2. read it back, fix the .md if a line is wrong
+python -m video_gen --show <id> --json
+
+# 3. render
+python -m video_gen --render <id> --json --output final.mp4
+```
+
+Images are cached by prompt, preset and seed, so step 3 after an edit only
+regenerates what changed.
+
+---
+
 ## Characters and voices
 
 Every character gets their own voice, chosen from what the host offers — on macOS
@@ -389,6 +533,112 @@ record whether the dialogue was actually audible.
 
 ---
 
+## Hosted providers
+
+Everything above runs offline, for free, with no account. These two tiers are
+the exception: they call a paid service, and they are **off until you switch
+them on**.
+
+```bash
+python -m video_gen --init-providers     # writes providers.yaml, all tiers off
+python -m video_gen --providers          # what is configured, what is ready
+```
+
+```yaml
+# providers.yaml
+music:
+  enabled: true
+  provider: elevenlabs     # agensi | lyria | elevenlabs | minimax | <your own>
+
+speech:
+  enabled: false
+  provider: elevenlabs-tts
+```
+
+```bash
+export ELEVENLABS_API_KEY=...
+python -m video_gen --doctor             # confirms the provider is ready
+```
+
+The file is looked for at `./providers.yaml`, then
+`~/.config/video_gen/providers.yaml`; `--providers-file` or
+`$VIDEO_GEN_PROVIDERS` override both. An agent can switch one on for a single
+run with `VIDEO_GEN_MUSIC_PROVIDER=elevenlabs` and no file at all.
+
+**Keys are read from the environment.** `api_key_env` names the variable; the
+key itself never has to appear in a file that might get committed, and
+`providers.yaml` is in `.gitignore` for the same reason. No key is ever printed,
+logged or included in a `--json` payload.
+
+### Four promises
+
+- **Off is the default.** With no config file, no socket is opened and
+  `--doctor` reports both tiers disabled.
+- **A failure costs fidelity, never the film.** Timeout, 402, rate limit,
+  undecodable response — the registry falls back to the offline path and the
+  render finishes. For voices, one failure disables the tier for the rest of the
+  render rather than paying per line for a dead provider.
+- **Results are cached** by prompt, duration, provider and seed, so
+  re-rendering an edited screenplay does not pay twice.
+- **One switch per tier.** Paying for a score does not start paying for voices.
+
+### Any other service
+
+A provider is data, not code. `preset` inherits a built-in request shape so you
+state only what differs:
+
+```yaml
+music:
+  enabled: true
+  provider: mine
+  providers:
+    mine:
+      endpoint: https://api.example.com/v1/music
+      api_key_env: MY_MUSIC_KEY
+      auth_header: Authorization
+      auth_prefix: "Bearer "
+      body:
+        prompt: "{prompt}"
+        seconds: "{duration_s:int}"
+      response: json:data.url      # audio | json:<path> | base64:<path>
+      audio_format: mp3
+```
+
+Placeholders: `{prompt}` `{mood}` `{duration_s}` `{duration_ms}` `{seed}`
+`{style}` `{title}` for music, `{text}` `{voice}` `{rate}` `{pitch}` for speech.
+Append `:int` or `:float` to send a number instead of a string — which is the
+difference between a working request and a 400.
+
+A hosted cue comes back at whatever length and sample rate the model felt like,
+and is resampled, then looped with a crossfade or trimmed to the timeline.
+
+---
+
+## Linux and containers
+
+macOS ships `say`. Linux ships nothing, and **without a synthesiser every line
+falls back to timed silence** — the render still produces a file, and it exits 2
+to say the file is unusable.
+
+```bash
+apt-get install -y espeak-ng
+```
+
+With it, the voice pool is built from espeak's own accent and variant listings,
+which gives up to 36 castable voices with both genders — not the single voice
+earlier versions offered, which made every character on Linux sound identical.
+
+A [`Dockerfile`](Dockerfile) is included. It installs `espeak-ng`,
+`libsndfile1` and a font for the captions, and **fails the build** rather than
+producing an image whose voices do not work:
+
+```bash
+docker build -t video-gen .
+docker run --rm -v "$PWD/output:/work/output" video-gen --self-test
+```
+
+---
+
 ## What runs where
 
 | | procedural | SD stills | identity | motion | LoRA training |
@@ -407,7 +657,8 @@ record whether the dialogue was actually audible.
 | visuals | Stable Diffusion | composed environments + staged figures |
 | character likeness | IP-Adapter from your reference image | stable per-character colour and staging |
 | motion | AnimateDiff / SVD clips | camera moves over stills |
-| voices | neural TTS | **system voices — fully working, 26 on macOS** |
+| voices | neural TTS, or hosted TTS | **system voices — fully working, 26 on macOS, up to 36 on Linux** |
+| score | hosted model (opt-in, paid) | **synthesised pads per scene mood — fully working** |
 | dialogue writing | **local LLM via Ollama — working, no GPU needed** | deterministic screenwriter |
 
 The writers' room is the one model-backed feature that needs **no GPU and no
@@ -420,10 +671,12 @@ Intel Mac, 16 GB, CPU-only, procedural backend:
 
 | | |
 |---|---|
-| self-test — 2 characters, 4 shots → 9.7 s of 720p | **15.1 s** |
+| self-test — 2 characters, 4 shots → 9.7 s of 720p | **12.4 s** |
+| 5-shot screenplay → 11.7 s of 720p | 16.8 s |
 | vertical ad, 720×1280 | 15.5 s |
 | dialogue for a 30 s film (`--llm`, llama3.2:1b) | 8–20 s |
-| test suite (176, offline) | ~8 s |
+| test suite — 265 offline unit tests | ~13 s |
+| test suite — everything, incl. 28 live renders | 2–6 min (image cache) |
 
 Faster than real time without a GPU.
 
@@ -487,14 +740,29 @@ can tell after the fact whether a given file was ever going to have sound.
 ## Tests
 
 ```bash
-pytest test.py            # 172 fast offline tests
-pytest test.py -m slow    # end-to-end renders + one real-model draft
+pytest test.py            # 265 offline unit tests, ~13 s
+pytest test.py -m slow    # 28 live renders and CLI round trips
 pytest test.py -m ''      # everything
 ```
 
-The identity and motion code paths are covered by a mock backend, and the
-writers' room by a mock LLM, so both are tested even on a machine that cannot
-load a model. The one test that drives a real LLM skips cleanly without one.
+Mocks stand in for what cannot run here: a mock visual backend covers the
+identity and motion paths, a mock LLM covers the writers' room, a mock music
+backend covers the hosted score, and `urlopen` is replaced for every hosted
+provider test — so nothing in the suite needs a model, a key or a network. The
+one test that drives a real local LLM skips cleanly without one.
+
+Two things are tested by standing in for a whole platform:
+
+- **espeak-ng** cannot be installed on the development machine, so its real
+  `--voices` output is used as a fixture and a **stub binary** on `PATH`
+  exercises the synthesis path. That stub is what proves `-v` reaches the
+  synthesiser — the bug that made every character on Linux share one voice.
+- **A machine with no TTS at all** is simulated to prove a silent render exits
+  2, since that is the one failure mode that otherwise looks like success.
+
+The `slow` set drives the real CLI through a subprocess and parses only stdout,
+because the promise being tested is about a process's exit code and output
+streams, not about what a function returns in-process.
 
 ---
 
@@ -518,6 +786,17 @@ load a model. The one test that drives a real LLM skips cleanly without one.
   narration you wrote.
 - **The procedural tier is stylised**, deliberately: geometric figures, no lip
   sync, no limb animation.
+- **`--seconds` is a target, not a guarantee.** Measured audio owns the clock,
+  so the real length is whatever the dialogue takes to speak. A 30 s target
+  typically lands between 20 and 30 s.
+- **The hosted tiers are written against each vendor's documented request
+  shape, not verified against a paid account.** The config layer, the request
+  built from it, the response parsing and every failure path are tested with
+  `urlopen` replaced; the endpoints themselves have never been called. If a
+  vendor has changed a field name, the declarative config is there so you can
+  correct it without touching code.
+- **The container is not built in CI.** The `Dockerfile` is checked by reading,
+  and self-verifies its voices at build time, but no automated build runs it.
 
 [decision.md](decision.md) — why each part is built the way it is, plus the audit
 of the 16 bugs fixed in v1.
@@ -526,7 +805,14 @@ of the 16 bugs fixed in v1.
 
 ## Requirements
 
-Python 3.9+. Any OS. ~200 MB installed, or ~3 GB with the optional model stack.
+Python 3.9+. Any OS. Seven runtime dependencies, ~200 MB installed, or ~3 GB
+with the optional model stack.
+
+Developed and tested on Python 3.13 (macOS) and built in a 3.12 container;
+3.9–3.11 are declared from the syntax used and are not exercised by CI.
+
+On Linux, `espeak-ng` for voices — see
+[Linux and containers](#linux-and-containers).
 
 ## License
 

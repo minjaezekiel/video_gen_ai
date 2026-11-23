@@ -88,6 +88,73 @@ conversation.
 - [x] **176 tests**, including one that drives a real local model and skips
       cleanly without one
 
+
+## v3.1 — the agent interface ✅ complete
+
+The engine was complete and only a person could drive it. Everything a caller
+that is not a person needs, plus the gaps that made it hard to adopt.
+
+- [x] **`--json` on every command**: one object on stdout, all human output on
+      stderr, never interactive (`--json` implies `--yes`). The contract lives
+      in `agent.py` alone, so the human and machine renderings cannot drift
+- [x] **Honest exit codes**: 0 ok · 1 usage · 2 **rendered with no audible
+      dialogue** · 3 failed · 4 cancelled. Code 2 is the one that matters: the
+      file is the right length, has real subtitles and plays silence, so a
+      caller checking only "did a file appear" could not see it
+- [x] **`--prompt` fixed**: documented in `--help` since v1 and never defined,
+      so argparse prefix-matched it to `--prompt-file` and died on a missing
+      file. A test now asserts every flag the epilogue advertises exists
+- [x] **Installable**: `pyproject.toml`, a `video-gen` entry point, `[ml]` and
+      `[dev]` extras, and five dependencies dropped that nothing imported
+      (`requests`, `beautifulsoup4`, `tqdm`, `scipy`; `certifi` moved to the ml
+      extra where the model downloads that need it live)
+- [x] **`--show`** returns a whole screenplay as JSON, so an agent can review a
+      script without parsing markdown; **`--no-render`** stops after writing it
+- [x] **Linux voice parity**: the espeak pool is built from espeak's own accent
+      and variant listings (up to 36 voices, both genders) instead of one
+      hardcoded "default", and `_speak_system` now actually passes `-v` — without
+      it every character on Linux spoke in the same voice
+- [x] **`SKILL.md`**, **`examples/`** with a verified example per input shape and
+      a working agent loop, and a **`Dockerfile`** that fails the build rather
+      than shipping an image whose voices do not work
+- [x] **Two defects found while writing the examples**: every screenplay was
+      titled "INT" (the abbreviation's full stop ends the first sentence), and
+      prose wrapped at 80 columns carried its line breaks into the captions
+- [x] **293 tests**, 265 of them offline in ~13 s
+
+## v3.2 — the music seam and the hosted tier ✅ complete
+
+Visuals, speech and the LLM each sat behind an interface. Music was a hardcoded
+sine-pad generator the renderer called directly, which made it the one thing
+that could not be upgraded without editing the renderer.
+
+- [x] **`MusicBackend`**, mirroring `VisualBackend`: a Protocol, a registry, and
+      capabilities (`bed`, `cue`, `prompt`). `ProceduralMusic` wraps the existing
+      synth unchanged, `MockMusic` drives the hosted path in the tests
+- [x] **The registry takes a chain, not a backend.** A paid provider that times
+      out, rate-limits, returns something undecodable or runs out of credit falls
+      back to the procedural bed, and the film still comes out. This is the
+      guarantee the whole tier rests on
+- [x] **Opt-in hosted providers**, off by default: with no config file no socket
+      is opened. One switch per tier, so paying for a score does not start paying
+      for voices. Presets for Agensi, Lyria, ElevenLabs Music, MiniMax and
+      ElevenLabs TTS
+- [x] **A provider is data, not code**: endpoint, auth header, request body and
+      where the audio sits in the response are all declarative, with `preset`
+      inheritance, so a new service is a few lines of YAML. `:int` coercion on a
+      lone placeholder, because sending `"30000"` where a number is expected is
+      a 400
+- [x] **Keys from the environment only**, `providers.yaml` in `.gitignore`, and
+      no key printed, logged or included in a payload
+- [x] **Results cached** by prompt, duration, provider and seed — each call costs
+      money, so re-rendering an edited screenplay must not pay twice
+- [x] **`--init-providers`** scaffolds a commented, all-disabled config;
+      **`--providers`** reports what is configured and what is ready
+- [x] **Hosted speech** as a third engine in `SpeechSynthesizer`, with hosted
+      voice ids cast round-robin alongside a system voice — so switching the tier
+      off leaves the cast audible rather than silent. One failure disables the
+      tier for the rest of the render
+
 ---
 
 ## Not done — known gaps
@@ -139,12 +206,18 @@ already carried through the model, the store and `ShotRequest`.
   animation win that needs no model at all.
 
 ### Audio
-- **MusicGen-small** for generated score, cached per mood.
+- **Verify the hosted providers against real accounts.** Every request shape in
+  `providers.py` is written from vendor documentation and has never been sent.
+  The config layer, response parsing and all the failure paths are tested with
+  `urlopen` replaced, but a renamed field would only show up against a live key.
+- **MusicGen-small** as a *local* `MusicBackend`, cached per mood — the seam now
+  exists, so this is an added file rather than a change to the renderer.
 - **Word-level timing** from the TTS to drive per-word caption highlighting.
 - **Sound effects** keyed off shot actions.
 
 ### Output
-- **`.srt` sidecar** — timings are already computed, this is nearly free.
+- **`.srt` sidecar** — timings are already computed, this is nearly free, and an
+  agent handing a video to a human usually wants one.
 - **Batch render** every `accepted` production.
 - **Resume**: skip shots whose cached image and audio are both current.
 
@@ -157,6 +230,9 @@ already carried through the model, the store and `ShotRequest`.
   instead of holding one.
 
 ### Workflow
+- **Run the suite on Linux and on Python 3.9–3.11.** Both are declared and
+  neither is exercised: espeak is covered by a stub binary and a fixture, and the
+  container is checked by reading rather than by building.
 - **Style references**: seed a new production's look from a past accepted one.
 - **`--edit`**: open the screenplay in `$EDITOR` before rendering.
 - **Web UI**, if the CLI stops being enough.

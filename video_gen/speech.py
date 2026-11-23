@@ -103,22 +103,57 @@ def apply_pitch(samples: np.ndarray, semitones: float) -> np.ndarray:
 class SpeechSynthesizer:
     """Renders a line of dialogue in a specific character's voice."""
 
-    def __init__(self, allow_neural: bool = True) -> None:
+    def __init__(self, allow_neural: bool = True, config=None) -> None:
         self.allow_neural = allow_neural
         self._neural = None
         self._neural_failed = not allow_neural
         self.command = system_tts_command()
+        self.config = config
         # A film with captions but no audible dialogue is a silent failure --
         # it looks finished and is completely broken. These counters let the
         # renderer notice and say so instead of shipping a mute video.
         self.voiced_lines = 0
         self.silent_lines = 0
         self.failures: List[str] = []
+        #: Which engine actually spoke, recorded into the render log.
+        self.engine_name = ""
+        self._hosted = None
+        self._hosted_failed = False
+
+    # -- hosted (opt-in, paid) --------------------------------------------- #
+
+    @property
+    def hosted(self):
+        """The hosted TTS provider, or None when the tier is off.
+
+        Resolved lazily and cached, including the negative case, so a run with
+        no providers config never reads one and never retries a dead provider
+        once per line.
+        """
+        if self._hosted_failed:
+            return None
+        if self._hosted is None:
+            providers = getattr(self.config, "providers", None)
+            if providers is None:
+                self._hosted_failed = True
+                return None
+            from .providers import SPEECH
+
+            spec = providers.spec_for(SPEECH)
+            if spec is None or spec.missing_key_reason():
+                self._hosted_failed = True
+                return None
+            self._hosted = spec
+        return self._hosted
 
     @property
     def available(self) -> bool:
         """Whether any synthesiser at all can produce audible speech."""
-        return self.command is not None or (self.allow_neural and not self._neural_failed)
+        return (
+            self.command is not None
+            or (self.allow_neural and not self._neural_failed)
+            or self.hosted is not None
+        )
 
     def probe(self, out_path: Optional[Path] = None) -> Tuple[bool, str]:
         """Actually synthesise a phrase and confirm it is audible.
@@ -197,8 +232,12 @@ class SpeechSynthesizer:
                     self.command,
                     "-s", str(int(165 * voice.rate)),
                     "-p", str(int(np.clip(50 + voice.pitch * 6, 0, 99))),
-                    "-w", str(raw), text,
                 ]
+                # Without this, every character on Linux speaks in espeak's
+                # default voice no matter what casting decided.
+                if voice.voice:
+                    argv += ["-v", voice.voice]
+                argv += ["-w", str(raw), text]
             subprocess.run(argv, check=True, capture_output=True, timeout=180)
             samples, rate = read_wav(raw)
             if samples.size < 8:
@@ -215,6 +254,47 @@ class SpeechSynthesizer:
         finally:
             raw.unlink(missing_ok=True)
 
+    # -- hosted ------------------------------------------------------------ #
+
+    def _speak_hosted(self, text: str, voice: VoiceProfile, out_path: Path):
+        """A paid provider speaks the line. Off unless a config says otherwise."""
+        spec = self.hosted
+        if spec is None:
+            return None
+
+        from . import providers as providers_mod
+        from .score.hosted import decode_audio
+
+        # A character carries its own hosted voice id when casting assigned
+        # one; otherwise the provider's first listed voice keeps output
+        # deterministic rather than random per line.
+        voice_id = voice.hosted_voice or (spec.voices[0] if spec.voices else "")
+        values = {
+            "text": text,
+            "voice": voice_id,
+            "rate": round(voice.rate, 3),
+            "pitch": round(voice.pitch, 2),
+            "gender": voice.gender or "",
+        }
+        try:
+            from .score.hosted import HostedMusic
+
+            audio, _ = HostedMusic(self.config)._request(spec, values)  # noqa: SLF001
+            samples = decode_audio(audio, DEFAULT_RATE)
+            if samples.size < 8:
+                raise RuntimeError("decoded to nothing")
+            write_wav(out_path, normalize(samples), DEFAULT_RATE)
+            self.engine_name = f"hosted:{spec.name}"
+            return out_path, len(samples) / DEFAULT_RATE
+        except Exception as exc:  # noqa: BLE001 - fall through to a local engine
+            LOGGER.warning("hosted TTS (%s) failed: %s", spec.name, exc)
+            self.failures.append(f"hosted {spec.name}: {exc}")
+            # One failure disables the tier for the rest of the render: paying
+            # for a provider that is down, once per line, is worse than
+            # finishing the film with system voices.
+            self._hosted_failed = True
+            return None
+
     # -- public ------------------------------------------------------------ #
 
     def speak(self, text: str, voice: VoiceProfile, out_path: Path) -> Tuple[Path, float]:
@@ -223,10 +303,17 @@ class SpeechSynthesizer:
         if not text:
             return self.silence(out_path, MIN_LINE_SECONDS)
 
+        if self.hosted is not None:
+            result = self._speak_hosted(text, voice, out_path)
+            if result is not None:
+                self.voiced_lines += 1
+                return result
+
         if self.allow_neural:
             result = self._speak_neural(text, voice, out_path)
             if result is not None:
                 self.voiced_lines += 1
+                self.engine_name = self.engine_name or "neural"
                 return result
         # A stored profile can say "silent" because discovery failed once on
         # some other machine. If a synthesiser exists now, use it anyway rather
@@ -235,6 +322,7 @@ class SpeechSynthesizer:
             result = self._speak_system(text, voice, out_path)
             if result is not None:
                 self.voiced_lines += 1
+                self.engine_name = self.engine_name or self.command
                 return result
             self.failures.append(f"{voice.voice or 'default voice'}: {self.command} produced nothing")
         elif not self.failures:

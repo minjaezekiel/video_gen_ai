@@ -152,15 +152,143 @@ def _traits_for(name: str) -> Dict[str, object]:
     return traits
 
 
+#: espeak-ng variant names whose gender its own listing does not state. The
+#: m1-m8 / f1-f5 families are the documented male and female variants, so the
+#: name is reliable where the Age/Gender column is "--".
+_VARIANT_GENDER = re.compile(r"^(?P<kind>[mf])(?P<index>\d+)$", re.I)
+
+#: Variants that exist to sound broken, not human.
+_VARIANT_NOVELTY = {
+    "croak", "whisper", "klatt", "klatt2", "klatt3", "klatt4", "robosoft",
+    "robosoft2", "robosoft3", "robosoft4", "robosoft5", "robosoft6",
+    "robosoft7", "robosoft8", "anikarobot", "demonic", "tweaky", "fast",
+}
+
+#: Keeping the espeak pool near the macOS pool's size is deliberate: casting
+#: only needs enough distinct, usefully different options to cast a small film,
+#: and 8 base accents times 30 variants would make `--doctor` unreadable.
+MAX_ESPEAK_VOICES = 36
+
+
+def _parse_espeak_rows(output: str) -> List[Dict[str, str]]:
+    """Parse `espeak-ng --voices` output.
+
+    Columns are ``Pty Language Age/Gender VoiceName File [Other Languages]``,
+    space-aligned rather than delimited, so this reads positionally and skips
+    anything that does not look like a row.
+    """
+    rows: List[Dict[str, str]] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or not parts[0].isdigit():
+            continue  # header, blank line or continuation
+        age_gender = parts[2]
+        age, _, gender = age_gender.partition("/")
+        rows.append(
+            {
+                "language": parts[1],
+                "age": age.strip("-") or "",
+                "gender": gender.strip("-").upper() or "",
+                "name": parts[3],
+                "file": parts[4],
+            }
+        )
+    return rows
+
+
+def _espeak_list(command: str, selector: str) -> List[Dict[str, str]]:
+    try:
+        output = subprocess.run(
+            [command, f"--voices={selector}"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout
+    except Exception as exc:  # noqa: BLE001 - a missing listing is not fatal
+        LOGGER.debug("%s --voices=%s failed: %s", command, selector, exc)
+        return []
+    return _parse_espeak_rows(output)
+
+
+def _gender_from(row: Dict[str, str], fallback: str = "unknown") -> str:
+    letter = (row.get("gender") or "").upper()
+    if letter.startswith("F"):
+        return "female"
+    if letter.startswith("M"):
+        return "male"
+    match = _VARIANT_GENDER.match(row.get("name", ""))
+    if match:
+        return "female" if match.group("kind").lower() == "f" else "male"
+    return fallback
+
+
+def _locale_for(language: str) -> str:
+    """`en-gb` -> `en_GB`, so SystemVoice.accent keeps working unchanged."""
+    base, _, region = language.replace("_", "-").partition("-")
+    if not region:
+        return f"{base}_{base.upper()}"
+    # espeak uses tags like en-gb-scotland and en-029; the first subtag is the
+    # one that identifies the accent.
+    return f"{base}_{region.split('-')[0].upper()}"
+
+
+def discover_espeak_voices(command: str, language: str = "en") -> List[SystemVoice]:
+    """Build a multi-voice pool from espeak-ng's own listings.
+
+    espeak exposes base voices per language and *variants* that reshape any of
+    them, so the real pool is their product. Taking only the base voices -- or
+    worse, one hardcoded "default" -- is what made every character on Linux
+    share a single voice while macOS got 26.
+    """
+    bases = [
+        row for row in _espeak_list(command, language)
+        if row["language"].split("-")[0].lower() == language.lower()
+    ]
+    if not bases:
+        # Every espeak build has at least this; better one working voice than
+        # none if the listing format ever changes under us.
+        return [SystemVoice(name=language, locale=_locale_for(language), gender="male")]
+
+    variants = [
+        row for row in _espeak_list(command, "variant")
+        if row["name"].lower() not in _VARIANT_NOVELTY
+    ]
+
+    voices: List[SystemVoice] = []
+    seen = set()
+
+    def add(name: str, locale: str, gender: str, age: str = "adult") -> None:
+        if name in seen or len(voices) >= MAX_ESPEAK_VOICES:
+            return
+        seen.add(name)
+        voices.append(SystemVoice(name=name, locale=locale, gender=gender, age=age))
+
+    # One plain voice per accent first, so a one-character film still gets the
+    # accent the description asked for before any variant is considered.
+    for row in bases:
+        add(row["language"], _locale_for(row["language"]), _gender_from(row, "male"))
+
+    # Then interleave variants across accents, so the pool stays accent-diverse
+    # rather than spending its whole budget on variants of en-us.
+    for index, variant in enumerate(variants):
+        if len(voices) >= MAX_ESPEAK_VOICES:
+            break
+        base = bases[index % len(bases)]
+        gender = _gender_from(variant, _gender_from(base, "male"))
+        add(
+            f"{base['language']}+{variant['name']}",
+            _locale_for(base["language"]),
+            gender,
+        )
+
+    return voices
+
+
 def discover_voices(language: str = "en") -> List[SystemVoice]:
     """Enumerate the host's voices, annotated with what we know about them."""
     command = system_tts_command()
     if command is None:
         return []
     if command != "say":
-        # espeak exposes a very different listing; one neutral voice is enough
-        # to keep multi-character output working on Linux.
-        return [SystemVoice(name="default", locale="en_US", gender="neutral")]
+        return discover_espeak_voices(command, language)
     try:
         output = subprocess.run(
             ["say", "-v", "?"], capture_output=True, text=True, timeout=20, check=True
@@ -298,11 +426,20 @@ def cast_voice(
     )
 
 
-def cast_production(characters: Sequence[Character], pool: Optional[Sequence[SystemVoice]] = None) -> None:
+def cast_production(
+    characters: Sequence[Character],
+    pool: Optional[Sequence[SystemVoice]] = None,
+    hosted_voices: Optional[Sequence[str]] = None,
+) -> None:
     """Assign a voice to every character that does not already have one.
 
     Characters are cast in a stable order so the result does not depend on the
     order they happened to be discovered in the script.
+
+    ``hosted_voices`` additionally assigns a paid provider's voice ids, dealt
+    round-robin in the same stable order. A system voice is still cast
+    alongside, so switching the hosted tier back off leaves every character
+    audible instead of silent.
     """
     voices = list(pool if pool is not None else discover_voices())
     ordered = sorted(characters, key=lambda c: c.key)
@@ -314,6 +451,12 @@ def cast_production(characters: Sequence[Character], pool: Optional[Sequence[Sys
         character.voice = profile
         if profile.voice:
             taken.append(profile.voice)
+
+    if hosted_voices:
+        available = list(hosted_voices)
+        for index, character in enumerate(ordered):
+            if not character.voice.hosted_voice:
+                character.voice.hosted_voice = available[index % len(available)]
 
 
 def describe_pool(pool: Optional[Sequence[SystemVoice]] = None) -> str:

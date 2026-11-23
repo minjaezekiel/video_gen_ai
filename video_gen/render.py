@@ -33,7 +33,8 @@ import moviepy.audio.fx as afx
 from .casting import cast_production, discover_voices
 from .config import CROSSFADE_SECONDS, MIN_SHOT_SECONDS, SHOT_TAIL_PAD, GenerationConfig
 from .model import Line, Production, Shot, stable_seed
-from .music import DEFAULT_MOOD, SAMPLE_RATE, duck, score_timeline, to_stereo
+from .music import DEFAULT_MOOD, SAMPLE_RATE, duck, to_stereo
+from .score import ScoreRequest, default_registry as default_music_registry
 from .speech import SpeechSynthesizer
 from .visuals import CharacterRef, ShotRequest, ShotVisual, character_palette, default_registry
 
@@ -122,12 +123,20 @@ class FilmRenderer:
         progress: Optional[ProgressCallback] = None,
         registry=None,
         synthesizer: Optional[SpeechSynthesizer] = None,
+        music_registry=None,
     ) -> None:
         self.config = config or GenerationConfig()
         self.progress: ProgressCallback = progress or (lambda pct, msg: None)
         self.registry = registry or default_registry(self.config)
-        self.speech = synthesizer or SpeechSynthesizer()
+        self.speech = synthesizer or SpeechSynthesizer(config=self.config)
         self.backend = self.registry.select(self.config.backend)
+        self.music = music_registry or default_music_registry(
+            self.config, getattr(self.config, "providers", None)
+        )
+        # Which backend actually scored the film, filled in by build_audio, so
+        # the render log records what was used rather than what was asked for.
+        self.score_backend = ""
+        self.score_detail = ""
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.image_cache_dir = self.config.cache_dir / "images"
@@ -496,8 +505,23 @@ class FilmRenderer:
                 end = starts[last_index] + shots[last_index].duration
                 segments.append((begin, min(end, total), scene.mood or DEFAULT_MOOD))
                 cursor += shot_count
-            bed = score_timeline(segments or [(0.0, total, DEFAULT_MOOD)], total, seed=self.config.seed)
-            bed = duck(bed, windows, depth_db=self.config.duck_db)
+            request = ScoreRequest(
+                segments=segments or [(0.0, total, DEFAULT_MOOD)],
+                total_duration=total,
+                seed=self.config.seed,
+                sample_rate=SAMPLE_RATE,
+                style=self.config.style,
+                format=production.format,
+                title=production.title,
+            )
+            # The registry falls back to the procedural bed if a hosted
+            # provider fails, so a paid outage costs fidelity, never a render.
+            score = self.music.render(request, prefer=self.config.music_backend)
+            self.score_backend = score.backend
+            self.score_detail = score.detail
+            bed = duck(
+                score.fitted(total, SAMPLE_RATE), windows, depth_db=self.config.duck_db
+            )
             tracks.append(
                 AudioArrayClip(to_stereo(bed, self.config.music_volume), fps=SAMPLE_RATE)
             )
@@ -597,6 +621,10 @@ class FilmRenderer:
             "per_shot_s": per_shot,
             "cast": {c.name: c.voice.voice for c in production.speaking_cast},
         }
+        if self.score_backend:
+            record["score_backend"] = self.score_backend
+        if getattr(self.speech, "engine_name", ""):
+            record["speech_engine"] = self.speech.engine_name
         production.renders.append(record)
         production.status = "rendered"
         self.progress(100.0, f"Done: {output}")

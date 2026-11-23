@@ -18,13 +18,46 @@ Last updated: 2026-08-23 · v3 (writers' room)
 | 4. Casting | ✅ done | 26 castable voices found on this machine, deterministic assignment |
 | 5. Speech | ✅ done | per-character voice, rate and pitch shaping |
 | 6. Music + ducking | ✅ done | per-scene mood, bed ducks −11 dB under dialogue |
+| 6b. Music backend seam | ✅ done | `MusicBackend` Protocol + registry; procedural / hosted / mock |
 | 7. Visual backend seam | ✅ done | Protocol + registry + procedural + mock |
 | 8. Render | ✅ done | single-clip timeline, speaker captions, motion-clip support |
 | 9. CLI | ✅ done | create / render / list / characters / cast / doctor / self-test |
 | 10. Diffusion backend | ⚠️ **written, never executed** | see [Unverified](#unverified-on-this-machine) |
 | 11. Writers' room | ✅ done | a local LLM writes dialogue; **verified here** against Ollama |
+| 12. Agent interface (v3.1) | ✅ done | `--json` on every command, documented exit codes, `agent.py` holds the contract |
+| 13. Packaging | ✅ done | `pyproject.toml`, `video-gen` entry point, `SKILL.md`, `examples/`, `Dockerfile` |
+| 14. Linux voice parity | ✅ done | espeak pool from its own listings; `-v` now actually passed |
+| 15. Hosted providers | ⚠️ **written, request shapes unverified** | config layer and every failure path tested; endpoints never called |
 
-**Tests: 176 passing** (172 fast in ~8 s, 4 slow: 3 renders + one real-model draft).
+**Tests: 293 passing** (265 fast in ~13 s, 28 slow: live renders and CLI
+subprocess round trips; 2–6 min depending on the image cache).
+
+### v3.1 — what an agent needs
+
+The repository already did the hard part; what it lacked was a caller that is
+not a person. Four things were missing, and one was actively broken:
+
+- **`--prompt` was documented in `--help` and did not exist.** argparse
+  prefix-matched it to `--prompt-file` and the run died with an unhandled
+  `FileNotFoundError`. A test now asserts every flag the epilogue advertises is
+  actually defined, because that is how the bug shipped.
+- **Exit codes were uniformly 0.** `command_create` returned 0 even when every
+  line of dialogue was silent. There are now five, and the one that matters is
+  `2`: an MP4 exists, is the right length, has real subtitles and plays silence.
+  A caller checking only "did a file appear" could not see it.
+- **No machine-readable output.** Every result was formatted prose, while the
+  data already existed — `confirm_and_render` computed it and the store wrote it
+  into frontmatter. `--json` emits it; `agent.py` is the only place the shape is
+  defined, so the human and machine renderings cannot drift.
+- **Not installable.** No `pyproject.toml`, so a skill could not depend on it.
+- **One voice on Linux.** `discover_voices` returned a single hardcoded
+  "default" for espeak, and `_speak_system` never passed `-v` at all, so the
+  headline feature degraded to one voice on every non-macOS host.
+
+`status` deserves a note: a production's own draft/accepted/rendered state
+collided with the envelope's command outcome. The envelope keeps `status`, a
+production's is `production_status`, and `CommandResult.payload` now prefixes
+any colliding key with `data_` rather than letting a command redefine `ok`.
 
 ### Step 11 — the writers' room (v3)
 
@@ -117,6 +150,11 @@ file; all 41 discovered voices work with the exact `say` invocation used.
 .venv/bin/python -m pytest test.py -m ''      # + end-to-end renders
 .venv/bin/python -m video_gen "a 30s advert for a bike shop" --yes
 .venv/bin/python -m video_gen "a 30s advert for a bike shop" --yes --llm
+
+# as an agent calls it
+.venv/bin/python -m video_gen --doctor --json
+.venv/bin/python -m video_gen --prompt "a 30s advert for a bike shop" --json
+.venv/bin/python examples/agent_workflow.py
 ```
 
 The writers' room needs `ollama serve` and one small local model
@@ -142,8 +180,15 @@ video_gen/
   casting.py       discover_voices(), infer_traits(), cast_voice(), cast_production()
   speech.py        SpeechSynthesizer, apply_rate/apply_pitch/normalize, wav IO
   music.py         MOODS, render_bed(), score_timeline(), duck(), mood_for()
+  providers.py     opt-in hosted provider config; presets, templating, extraction
+  agent.py         the --json contract: payloads, exit codes, CommandResult
   render.py        FilmRenderer: shots -> frames -> timeline -> mux -> MP4
-  cli.py           argparse + all commands
+  cli.py           argparse + all commands, human and --json from one code path
+  score/
+    base.py        MusicBackend Protocol, ScoreRequest/Result, MusicRegistry
+    procedural.py  ProceduralMusic: synthesised pads (always available)
+    hosted.py      HostedMusic: opt-in paid provider + decode_audio  ⚠️ UNVERIFIED
+    mock.py        MockMusic: deterministic fake claiming every capability
   visuals/
     base.py        VisualBackend Protocol, ShotRequest, ShotVisual, BackendRegistry
     procedural.py  ProceduralBackend: environments + staged figures (always available)
@@ -153,6 +198,11 @@ video_gen/
 video_generator.py  compatibility shim
 verify_backends.py  run this on GPU hardware to test diffusion.py for the first time
 test.py             the whole suite
+
+pyproject.toml      packaging; `video-gen` entry point, [ml] and [dev] extras
+SKILL.md            the agent-facing contract, packaged as a skill
+Dockerfile          Linux image with espeak-ng; fails the build if voices do not work
+examples/           one verified example per input shape + agent_workflow.py
 ```
 
 ### Key call path
@@ -226,6 +276,29 @@ loading, SD-Turbo/SD1.5 stills, IP-Adapter identity conditioning, AnimateDiff
 motion, and every timing estimate for those paths. `DiffusionBackend.train_character`
 raises `NotImplementedError` on purpose — LoRA training cannot be written blind.
 
+**The hosted provider endpoints have never been called.** `score/hosted.py` is
+written against each vendor's documented request shape; no paid account exists
+here. What *is* tested, with `urlopen` replaced: the config layer, the request
+built from a spec, body templating and its `:int` coercion, every response shape
+(`audio`, `json:<path>`, `base64:<path>`, a `data:` URI, bare hex, and a URL
+that is then fetched), caching, and every failure path — HTTP error, unreachable
+host, undecodable body, empty body — each falling back to the procedural score.
+`decode_audio` is exercised against a real wav through the bundled ffmpeg.
+
+If a vendor has renamed a field, the declarative config is the fix: a user
+corrects `providers.yaml` without touching code, which is why the layer is data
+rather than per-provider classes.
+
+**espeak-ng has never run here either**, for the same reason as torch: it is not
+installable on this machine. Its real `--voices` output is used as a fixture and
+a stub binary on `PATH` exercises synthesis, which is what proves `-v` is passed.
+The parsing and the pool construction are tested; the actual sound espeak makes
+is not.
+
+**The Dockerfile is not built in CI.** It self-verifies its own voices at build
+time — `--doctor --json` must report working speech and more than one castable
+voice, or the build fails — but no automated run exercises it.
+
 ---
 
 ## Known gaps
@@ -247,6 +320,16 @@ raises `NotImplementedError` on purpose — LoRA training cannot be written blin
   `characters/<id>.md`, or re-roll with `--cast <id>`.
 - **The procedural tier is stylised, not photoreal**, by design. Figures are
   geometric silhouettes; there is no lip sync and no limb animation.
+- **`--seconds` is a target the pacing aims at, not a guarantee.** Measured
+  audio owns the clock, so a 30 s target typically lands between 20 and 30 s.
+  Honouring it exactly would mean padding or cutting dialogue.
+- **Hosted speech reuses `HostedMusic._request`** rather than having its own
+  HTTP client. The request shape is identical and duplicating it would mean two
+  places to fix a bug, but it is a private method crossing a module boundary —
+  worth extracting if a third hosted tier appears.
+- **Python 3.9–3.11 are declared, not exercised.** The syntax is compatible and
+  nothing newer is used, but the suite only runs on 3.13 here and 3.12 in the
+  container.
 - `psutil` is referenced by the MPS VRAM probe but is not a dependency; the probe
   degrades to `False` if it is missing.
 

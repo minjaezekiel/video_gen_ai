@@ -205,6 +205,10 @@ class GenerationConfig:
     use_llm: bool = False
     llm_model: str = ""  # name a local model, else the best small one is chosen
     backend: Optional[str] = None  # force one visual backend, else auto-detect
+    music_backend: Optional[str] = None  # force one music backend, else auto-detect
+    #: Path to a providers.yaml. None means "look in the usual places"; every
+    #: hosted tier stays off unless one of them switches it on.
+    providers_file: Optional[Path] = None
     output_dir: Path = Path("output")
     scripts_dir: Path = Path("video_scripts")
     characters_dir: Path = Path("characters")
@@ -231,6 +235,9 @@ class GenerationConfig:
         self.scripts_dir = Path(self.scripts_dir)
         self.characters_dir = Path(self.characters_dir)
         self.cache_dir = Path(self.cache_dir)
+        if self.providers_file is not None:
+            self.providers_file = Path(self.providers_file)
+        self._providers = None
 
     @staticmethod
     def resolution_for(preset: str, aspect: str) -> Tuple[int, int]:
@@ -248,6 +255,20 @@ class GenerationConfig:
         else:
             width, height = short, int(round(short / ratio))
         return (width + (width % 2), height + (height % 2))
+
+    @property
+    def providers(self):
+        """The hosted-provider config, loaded once and cached.
+
+        Resolved lazily so a run that never touches a hosted tier never reads a
+        file, and so the result is stable for the whole render: a config that
+        changed mid-render would mean two scenes scored by different services.
+        """
+        if self._providers is None:
+            from .providers import load
+
+            self._providers = load(self.providers_file)
+        return self._providers
 
     @property
     def preset_data(self) -> Dict[str, object]:

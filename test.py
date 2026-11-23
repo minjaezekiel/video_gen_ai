@@ -15,6 +15,8 @@ paths be tested here despite no model ever being loaded.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +70,28 @@ from video_gen.writersroom import (
 )
 from video_gen.model import NARRATOR, character_key, parse_scenes, slugify, stable_seed
 from video_gen.music import MOODS, duck, mood_for, render_bed, score_timeline
+from video_gen import agent, providers
+from video_gen.agent import (
+    EXIT_CANCELLED,
+    EXIT_FAILED,
+    EXIT_NO_AUDIO,
+    EXIT_OK,
+    EXIT_USAGE,
+    CommandResult,
+)
+from video_gen.casting import discover_espeak_voices, _parse_espeak_rows
+from video_gen.score import (
+    BED,
+    CUE,
+    PROMPT,
+    HostedMusic,
+    MockMusic,
+    MusicRegistry,
+    ProceduralMusic,
+    ScoreRequest,
+    ScoreResult,
+    decode_audio,
+)
 from video_gen.speech import apply_pitch, apply_rate, normalize
 from video_gen.visuals import (
     IDENTITY,
@@ -1533,3 +1557,1463 @@ def test_portrait_film_renders(config, tmp_path):
     with FilmRenderer(vertical, registry=BackendRegistry([ProceduralBackend(vertical)])) as film:
         path = film.render(production)
     assert path.exists() and path.stat().st_size > 5_000
+
+
+# --------------------------------------------------------------------------- #
+# Hosted providers: the config layer
+#
+# The thing being tested is mostly the *absence* of behaviour. Nothing here may
+# open a socket, and no tier may switch itself on.
+# --------------------------------------------------------------------------- #
+
+
+def test_no_config_file_means_every_hosted_tier_is_off(tmp_path, monkeypatch):
+    """The default has to be offline, including with a stray env var unset."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("VIDEO_GEN_PROVIDERS", raising=False)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "nohome"))
+
+    config = providers.load(env={})
+    assert config.source is None
+    for tier in providers.TIERS:
+        assert config.is_enabled(tier) is False
+        assert config.spec_for(tier) is None
+    assert all(row["ready"] is False for row in config.status())
+
+
+def test_presets_are_listed_even_with_no_config(tmp_path, monkeypatch):
+    """`--providers` has to be able to say what *could* be switched on."""
+    monkeypatch.chdir(tmp_path)
+    config = providers.load(env={})
+    assert {"agensi", "lyria", "elevenlabs", "minimax", "elevenlabs-tts"} <= set(config.specs)
+    assert config.specs["elevenlabs"].tier == providers.MUSIC
+    assert config.specs["elevenlabs-tts"].tier == providers.SPEECH
+
+
+def test_a_config_file_switches_one_tier_on(tmp_path):
+    path = tmp_path / "providers.yaml"
+    path.write_text(
+        "music:\n  enabled: true\n  provider: elevenlabs\n"
+        "speech:\n  enabled: false\n  provider: elevenlabs-tts\n",
+        encoding="utf-8",
+    )
+    config = providers.load(path, env={"ELEVENLABS_API_KEY": "k"})
+    assert config.source == path
+    assert config.is_enabled(providers.MUSIC)
+    spec = config.spec_for(providers.MUSIC)
+    assert spec is not None and spec.name == "elevenlabs"
+    # The other tier stays off: one switch must not move the other.
+    assert config.spec_for(providers.SPEECH) is None
+
+
+def test_a_key_comes_from_the_environment_not_the_file(tmp_path, monkeypatch):
+    path = tmp_path / "providers.yaml"
+    path.write_text("music:\n  enabled: true\n  provider: elevenlabs\n", encoding="utf-8")
+
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    spec = providers.load(path).specs["elevenlabs"]
+    assert spec.key() == ""
+    assert "ELEVENLABS_API_KEY" in spec.missing_key_reason()
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "secret-value")
+    spec = providers.load(path).specs["elevenlabs"]
+    assert spec.key() == "secret-value"
+    assert spec.missing_key_reason() is None
+
+
+def test_a_redacted_spec_never_carries_the_key():
+    spec = providers.ProviderSpec(name="x", endpoint="https://e", api_key="hunter2")
+    blob = json.dumps(spec.redacted())
+    assert "hunter2" not in blob
+    assert spec.redacted()["api_key_present"] is True
+
+
+def test_the_environment_can_switch_a_tier_on_for_one_run(tmp_path, monkeypatch):
+    """An agent must be able to do this without writing a file."""
+    monkeypatch.chdir(tmp_path)
+    config = providers.load(
+        env={"VIDEO_GEN_MUSIC_PROVIDER": "minimax", "MINIMAX_API_KEY": "k"}
+    )
+    assert config.is_enabled(providers.MUSIC)
+    assert config.selected[providers.MUSIC] == "minimax"
+    # ...and off again, explicitly.
+    off = providers.load(env={"VIDEO_GEN_MUSIC_PROVIDER": "minimax", "VIDEO_GEN_MUSIC_HOSTED": "false"})
+    assert off.is_enabled(providers.MUSIC) is False
+
+
+def test_a_broken_config_leaves_everything_off_rather_than_raising(tmp_path):
+    """A syntax error in an optional file must not stop an offline render."""
+    path = tmp_path / "providers.yaml"
+    path.write_text("music:\n  enabled: [unclosed\n", encoding="utf-8")
+    config = providers.load(path, env={})
+    assert config.is_enabled(providers.MUSIC) is False
+
+    path.write_text("- not a mapping\n", encoding="utf-8")
+    assert providers.load(path, env={}).is_enabled(providers.MUSIC) is False
+
+
+def test_a_tier_pointed_at_an_unknown_or_wrong_provider_stays_off(tmp_path):
+    path = tmp_path / "providers.yaml"
+    path.write_text("music:\n  enabled: true\n  provider: nope\n", encoding="utf-8")
+    assert providers.load(path, env={}).spec_for(providers.MUSIC) is None
+
+    # A speech provider named in the music slot is a configuration mistake, not
+    # a licence to POST a music request at a TTS endpoint.
+    path.write_text("music:\n  enabled: true\n  provider: elevenlabs-tts\n", encoding="utf-8")
+    config = providers.load(path, env={"ELEVENLABS_API_KEY": "k"})
+    assert config.spec_for(providers.MUSIC) is None
+
+
+def test_a_custom_provider_inherits_a_preset_shape(tmp_path):
+    path = tmp_path / "providers.yaml"
+    path.write_text(
+        "music:\n"
+        "  enabled: true\n"
+        "  provider: mine\n"
+        "  providers:\n"
+        "    mine:\n"
+        "      preset: elevenlabs\n"
+        "      endpoint: https://example.test/music\n"
+        "      api_key_env: MINE_KEY\n",
+        encoding="utf-8",
+    )
+    spec = providers.load(path, env={"MINE_KEY": "k"}).spec_for(providers.MUSIC)
+    assert spec is not None
+    assert spec.endpoint == "https://example.test/music"
+    assert spec.api_key_env == "MINE_KEY"
+    # Inherited from the preset rather than restated.
+    assert spec.auth_header == "xi-api-key"
+    assert spec.response == "audio"
+
+
+def test_init_providers_writes_a_disabled_config(tmp_path):
+    path = providers.write_example(tmp_path / "providers.yaml")
+    assert path.is_file()
+    config = providers.load(path, env={})
+    assert config.is_enabled(providers.MUSIC) is False
+    assert config.is_enabled(providers.SPEECH) is False
+    with pytest.raises(FileExistsError):
+        providers.write_example(path)
+    assert providers.write_example(path, force=True) == path
+
+
+# --------------------------------------------------------------------------- #
+# Request templating
+# --------------------------------------------------------------------------- #
+
+
+def test_fill_substitutes_through_nested_structures():
+    template = {"a": "{prompt}", "b": [{"c": "take {seed}"}], "d": 7}
+    out = providers.fill(template, {"prompt": "hello", "seed": 3})
+    assert out == {"a": "hello", "b": [{"c": "take 3"}], "d": 7}
+
+
+def test_a_lone_placeholder_keeps_its_type():
+    """`"{duration_ms:int}"` sending the string "30000" is a 400 from the API."""
+    out = providers.fill({"len": "{duration_ms:int}", "x": "n={seed}"}, {"duration_ms": 30000.4, "seed": 2})
+    assert out["len"] == 30000 and isinstance(out["len"], int)
+    assert out["x"] == "n=2"  # interpolated into text, so it stays a string
+
+
+def test_an_unknown_placeholder_is_left_alone_rather_than_blanked():
+    assert providers.fill("{nope}", {"a": 1}) == "{nope}"
+
+
+@pytest.mark.parametrize(
+    "selector,response,expected",
+    [
+        ("audio", b"RAWBYTES", b"RAWBYTES"),
+        ("base64:d.v", {"d": {"v": "aGVsbG8="}}, b"hello"),
+        ("json:predictions.0.url", {"predictions": [{"url": "https://x/y.mp3"}]}, None),
+        ("json:d.a", {"d": {"a": "data:audio/mp3;base64,aGVsbG8="}}, b"hello"),
+        ("json:d.a", {"d": {"a": "68656c6c6f" * 8}}, bytes.fromhex("68656c6c6f" * 8)),
+    ],
+)
+def test_extract_finds_audio_wherever_a_vendor_put_it(selector, response, expected):
+    audio, url = providers.extract(response, selector)
+    assert audio == expected
+    if expected is None:
+        assert url == "https://x/y.mp3"
+
+
+@pytest.mark.parametrize(
+    "selector,response",
+    [
+        ("json:a.b", {"a": {}}),
+        ("json:a.99", {"a": [1]}),
+        ("base64:a", {"a": "not base64 !!!"}),
+        ("json:a.b", b"not json at all"),
+    ],
+)
+def test_extract_reports_nothing_rather_than_guessing(selector, response):
+    assert providers.extract(response, selector) == (None, None)
+
+
+# --------------------------------------------------------------------------- #
+# Music backends
+#
+# The guarantee under test everywhere here: a score never fails a render. A
+# hosted provider that breaks costs fidelity, never the film.
+# --------------------------------------------------------------------------- #
+
+
+def score_request(duration: float = 4.0, **kwargs) -> ScoreRequest:
+    kwargs.setdefault("segments", [(0.0, duration / 2, "tense"), (duration / 2, duration, "warm")])
+    kwargs.setdefault("sample_rate", 8000)
+    return ScoreRequest(total_duration=duration, seed=7, **kwargs)
+
+
+def test_the_procedural_score_is_always_available_and_fills_the_timeline():
+    backend = ProceduralMusic()
+    assert backend.available() is True
+    assert backend.capabilities() == {BED, CUE}
+    result = backend.render(score_request(4.0))
+    assert result.backend == "procedural"
+    # Within a sample of the asked-for length, and audible.
+    assert abs(len(result.samples) / 8000 - 4.0) < 0.01
+    assert float(np.max(np.abs(result.samples))) > 0.01
+
+
+def test_the_procedural_score_is_deterministic():
+    a = ProceduralMusic().render(score_request())
+    b = ProceduralMusic().render(score_request())
+    assert np.array_equal(a.samples, b.samples)
+
+
+def test_a_mood_change_actually_changes_the_music():
+    """Per-scene cues are the point; one looped pad would be a regression."""
+    tense = ProceduralMusic().render(score_request(segments=[(0.0, 4.0, "tense")]))
+    warm = ProceduralMusic().render(score_request(segments=[(0.0, 4.0, "warm")]))
+    assert not np.allclose(tense.samples, warm.samples)
+
+
+def test_the_registry_prefers_the_higher_priority_backend():
+    registry = MusicRegistry([ProceduralMusic(), MockMusic()])
+    assert registry.select().name == "mock"  # priority 99 beats 10
+    assert registry.select("procedural").name == "procedural"
+
+
+def test_an_unavailable_backend_is_not_selected():
+    class Off(ProceduralMusic):
+        name = "off"
+        priority = 500
+
+        def available(self) -> bool:
+            return False
+
+    registry = MusicRegistry([Off(), ProceduralMusic()])
+    assert registry.select().name == "procedural"
+    with pytest.raises(ValueError):
+        registry.select("off")
+
+
+def test_a_failing_hosted_backend_falls_back_instead_of_failing_the_render():
+    """The whole reason the registry takes a chain rather than one backend."""
+    broken = MockMusic(fail=True)
+    registry = MusicRegistry([broken, ProceduralMusic()])
+    result = registry.render(score_request())
+    assert broken.calls == 1  # it really was tried
+    assert result.backend == "procedural"
+    assert result.samples.size
+
+
+def test_a_backend_returning_silence_also_falls_back():
+    """An empty array is a failure too, and a subtler one than an exception."""
+    registry = MusicRegistry([MockMusic(empty=True), ProceduralMusic()])
+    assert registry.render(score_request()).backend == "procedural"
+
+
+def test_every_backend_failing_raises_with_all_the_reasons():
+    registry = MusicRegistry([MockMusic(fail=True)])
+    with pytest.raises(RuntimeError) as caught:
+        registry.render(score_request())
+    assert "mock" in str(caught.value)
+
+
+def test_a_broken_availability_probe_does_not_take_the_registry_down():
+    class Exploding(ProceduralMusic):
+        name = "exploding"
+        priority = 900
+
+        def available(self) -> bool:
+            raise RuntimeError("probe blew up")
+
+    registry = MusicRegistry([Exploding(), ProceduralMusic()])
+    assert registry.select().name == "procedural"
+    rows = {row["name"]: row for row in registry.report()}
+    assert rows["exploding"]["available"] is False
+
+
+def test_the_report_lists_every_backend_available_or_not():
+    rows = MusicRegistry([MockMusic(), ProceduralMusic()]).report()
+    assert [row["name"] for row in rows] == ["mock", "procedural"]
+    assert all(set(row) >= {"name", "available", "capabilities", "detail"} for row in rows)
+
+
+# -- fitting a hosted cue to the timeline ----------------------------------- #
+
+
+def test_a_short_hosted_cue_is_looped_to_fill_the_timeline():
+    """Providers return whatever length they like; a silent tail is not an option."""
+    result = ScoreResult("x", np.ones(1000, dtype=np.float32) * 0.5, 1000)
+    fitted = result.fitted(5.0, 1000)
+    assert len(fitted) == 5000
+    assert float(np.max(np.abs(fitted))) > 0.1
+
+
+def test_a_long_hosted_cue_is_trimmed_not_sped_up():
+    result = ScoreResult("x", np.ones(9000, dtype=np.float32), 1000)
+    assert len(result.fitted(2.0, 1000)) == 2000
+
+
+def test_a_hosted_cue_at_the_wrong_rate_is_resampled():
+    result = ScoreResult("x", np.ones(2000, dtype=np.float32), 2000)  # 1s at 2kHz
+    assert len(result.fitted(1.0, 8000)) == 8000
+
+
+def test_an_empty_result_fits_to_silence_rather_than_crashing():
+    fitted = ScoreResult("x", np.zeros(0, dtype=np.float32), 1000).fitted(2.0, 1000)
+    assert len(fitted) == 2000 and not fitted.any()
+
+
+def test_a_stereo_result_is_folded_to_mono():
+    stereo = np.stack([np.ones(100), np.zeros(100)], axis=1).astype(np.float32)
+    assert ScoreResult("x", stereo, 1000).samples.shape == (100,)
+
+
+def test_a_prompt_is_built_from_the_moods_for_models_that_take_one():
+    request = score_request(segments=[(0.0, 2.0, "tense"), (2.0, 4.0, "warm")], title="The Signal")
+    prompt = request.prompt_for()
+    assert "tense" in prompt and "warm" in prompt
+    assert "The Signal" in prompt
+    # The two things that make a score usable under dialogue.
+    assert "no vocals" in prompt and "dialogue" in prompt
+    # An explicit prompt is never overwritten.
+    assert score_request(prompt="exact words").prompt_for() == "exact words"
+
+
+# --------------------------------------------------------------------------- #
+# The hosted music backend
+#
+# No test here reaches the network: urlopen is replaced. What is being checked
+# is the request we *would* have sent, and that every failure degrades.
+# --------------------------------------------------------------------------- #
+
+
+class FakeResponse:
+    """Enough of http.client.HTTPResponse for urlopen's context manager."""
+
+    def __init__(self, body: bytes, content_type: str = "audio/mpeg") -> None:
+        self._body = body
+        self.headers = {"Content-Type": content_type}
+
+    def read(self, amount: int = -1) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def wav_bytes(tmp_path):
+    """A real wav, so decode_audio is exercised by the bundled ffmpeg."""
+    from video_gen.speech import write_wav
+
+    path = tmp_path / "cue.wav"
+    t = np.arange(8000, dtype=np.float32) / 8000
+    write_wav(path, (0.4 * np.sin(2 * np.pi * 220 * t)).astype(np.float32), 8000)
+    return path.read_bytes()
+
+
+def hosted_config(tmp_path, response="audio", **extra):
+    """A HostedMusic wired to a one-provider config, with caching in tmp_path."""
+    spec = providers.ProviderSpec(
+        name="test-music",
+        tier=providers.MUSIC,
+        endpoint="https://example.test/v1/music",
+        api_key="key-123",
+        auth_header="x-api-key",
+        auth_prefix="",
+        body={"prompt": "{prompt}", "ms": "{duration_ms:int}"},
+        response=response,
+        **extra,
+    )
+    config = providers.ProvidersConfig(
+        enabled={providers.MUSIC: True, providers.SPEECH: False},
+        selected={providers.MUSIC: "test-music", providers.SPEECH: ""},
+        specs={"test-music": spec},
+    )
+    return config, spec
+
+
+def test_hosted_music_is_unavailable_with_no_config():
+    """Off by default means `available()` is False, not a connection attempt."""
+    backend = HostedMusic(None, providers.ProvidersConfig())
+    assert backend.available() is False
+    assert "disabled" in backend.describe()
+    with pytest.raises(RuntimeError):
+        backend.render(score_request())
+
+
+def test_hosted_music_is_unavailable_without_a_key(tmp_path):
+    config, spec = hosted_config(tmp_path)
+    spec.api_key = ""
+    spec.api_key_env = "DEFINITELY_NOT_SET_12345"
+    backend = HostedMusic(None, config)
+    assert backend.available() is False
+    assert "DEFINITELY_NOT_SET_12345" in backend.describe()
+
+
+def test_hosted_music_sends_the_request_the_provider_documents(tmp_path, wav_bytes, monkeypatch, config):
+    providers_config, _ = hosted_config(tmp_path)
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["method"] = request.method
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.data.decode())
+        return FakeResponse(wav_bytes, "audio/wav")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    backend = HostedMusic(config, providers_config)
+    assert backend.available() is True
+    result = backend.render(score_request(30.0))
+
+    assert captured["url"] == "https://example.test/v1/music"
+    assert captured["method"] == "POST"
+    # Header names are capitalised by urllib; the value is what matters.
+    assert captured["headers"]["X-api-key"] == "key-123"
+    assert captured["body"]["ms"] == 30000 and isinstance(captured["body"]["ms"], int)
+    assert "tense" in captured["body"]["prompt"]
+    assert result.backend == "hosted" and result.samples.size
+
+
+def test_hosted_music_follows_a_url_when_that_is_what_came_back(tmp_path, wav_bytes, monkeypatch, config):
+    providers_config, _ = hosted_config(tmp_path, response="json:data.url")
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        if len(calls) == 1:
+            return FakeResponse(
+                json.dumps({"data": {"url": "https://cdn.test/a.wav"}}).encode(),
+                "application/json",
+            )
+        return FakeResponse(wav_bytes, "audio/wav")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    result = HostedMusic(config, providers_config).render(score_request())
+    assert calls == ["https://example.test/v1/music", "https://cdn.test/a.wav"]
+    assert result.samples.size
+
+
+def test_a_hosted_result_is_cached_so_a_re_render_does_not_pay_twice(tmp_path, wav_bytes, monkeypatch, config):
+    """Each call costs money, so the cache matters more here than for images."""
+    providers_config, _ = hosted_config(tmp_path)
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(1)
+        return FakeResponse(wav_bytes, "audio/wav")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    request = score_request(3.0)
+    first = HostedMusic(config, providers_config).render(request)
+    second = HostedMusic(config, providers_config).render(request)
+    assert len(calls) == 1
+    assert "cached" in second.detail
+    assert np.allclose(first.samples, second.samples)
+
+
+def test_a_different_request_is_not_served_from_the_cache(tmp_path, wav_bytes, monkeypatch, config):
+    providers_config, _ = hosted_config(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout=None: (calls.append(1), FakeResponse(wav_bytes, "audio/wav"))[1],
+    )
+    backend = HostedMusic(config, providers_config)
+    backend.render(score_request(3.0))
+    backend.render(score_request(9.0))
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "body,content_type",
+    [
+        (b"not audio at all", "audio/mpeg"),
+        (b'{"unexpected": "shape"}', "application/json"),
+        (b"", "audio/mpeg"),
+    ],
+)
+def test_an_undecodable_response_raises_so_the_registry_can_fall_back(
+    tmp_path, monkeypatch, config, body, content_type
+):
+    providers_config, _ = hosted_config(tmp_path)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout=None: FakeResponse(body, content_type),
+    )
+    with pytest.raises(RuntimeError):
+        HostedMusic(config, providers_config).render(score_request())
+
+
+def test_an_http_error_is_reported_with_the_providers_own_message(tmp_path, monkeypatch, config):
+    import io
+    import urllib.error
+
+    providers_config, _ = hosted_config(tmp_path)
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 402, "Payment Required", {}, io.BytesIO(b"out of credit")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError) as caught:
+        HostedMusic(config, providers_config).render(score_request())
+    assert "402" in str(caught.value) and "out of credit" in str(caught.value)
+
+
+def test_a_hosted_failure_still_produces_a_film_through_the_registry(tmp_path, monkeypatch, config):
+    """End to end: the provider is down and the score comes out anyway."""
+    import urllib.error
+
+    providers_config, _ = hosted_config(tmp_path)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout=None: (_ for _ in ()).throw(urllib.error.URLError("no route")),
+    )
+    registry = MusicRegistry([HostedMusic(config, providers_config), ProceduralMusic()])
+    result = registry.render(score_request())
+    assert result.backend == "procedural"
+    assert result.samples.size
+
+
+def test_decode_audio_round_trips_a_real_wav(wav_bytes):
+    samples = decode_audio(wav_bytes, 8000)
+    assert abs(len(samples) / 8000 - 1.0) < 0.05
+    assert 0.1 < float(np.max(np.abs(samples))) <= 1.0
+
+
+def test_decode_audio_rejects_rubbish_rather_than_returning_noise():
+    assert decode_audio(b"", 8000).size == 0
+    with pytest.raises(RuntimeError):
+        decode_audio(b"\x00\x01\x02 not a container", 8000)
+
+
+# --------------------------------------------------------------------------- #
+# Linux voices
+#
+# espeak-ng cannot be installed on the development machine, so these tests use
+# its real listing format as a fixture and a stub binary for the synthesis
+# path. That stub is what proves `-v` is actually passed -- the bug that made
+# every character on Linux share one voice.
+# --------------------------------------------------------------------------- #
+
+ESPEAK_EN = """\
+Pty Language       Age/Gender VoiceName          File                 Other Languages
+ 5  en-029          --/M      en-caribbean       gmw/en-029
+ 2  en-gb           --/M      en-english         gmw/en
+ 5  en-gb-scotland  --/M      en-scottish        gmw/en-GB-scotland   (en 4)
+ 5  en-gb-x-gbclan  --/M      en-english-north   gmw/en-GB-x-gbclan   (en-gb 3)
+ 5  en-us           --/M      en-us              gmw/en-US            (en 3)
+ 7  af              --/M      Afrikaans          gmw/af
+"""
+
+ESPEAK_VARIANTS = """\
+Pty Language       Age/Gender VoiceName          File                 Other Languages
+ 5  variant         --/M      Alicia             !v/Alicia
+ 5  variant         --/F      Annie              !v/Annie
+ 5  variant          -/M      m1                 !v/m1
+ 5  variant          -/M      m2                 !v/m2
+ 5  variant          -/M      m3                 !v/m3
+ 5  variant          -/F      f1                 !v/f1
+ 5  variant          -/F      f2                 !v/f2
+ 5  variant          -/F      f3                 !v/f3
+ 5  variant          -/M      croak              !v/croak
+ 5  variant          -/M      whisper            !v/whisper
+ 5  variant          -/M      robosoft           !v/robosoft
+"""
+
+
+def test_the_espeak_listing_format_parses():
+    rows = _parse_espeak_rows(ESPEAK_EN)
+    assert len(rows) == 6  # the header is not a row
+    assert rows[1] == {
+        "language": "en-gb", "age": "", "gender": "M",
+        "name": "en-english", "file": "gmw/en",
+    }
+    assert _parse_espeak_rows("") == []
+    assert _parse_espeak_rows("garbage\nmore garbage") == []
+
+
+def fake_espeak(monkeypatch, en=ESPEAK_EN, variants=ESPEAK_VARIANTS):
+    """Answer `--voices=` without an espeak binary present."""
+    def fake_list(command, selector):
+        from video_gen.casting import _parse_espeak_rows as parse
+
+        return parse(en if selector != "variant" else variants)
+
+    monkeypatch.setattr("video_gen.casting._espeak_list", fake_list)
+
+
+def test_linux_gets_a_real_voice_pool_not_one_voice(monkeypatch):
+    """The whole point: 'a voice per character' has to mean something here."""
+    fake_espeak(monkeypatch)
+    voices = discover_espeak_voices("espeak-ng", "en")
+    assert len(voices) > 10
+    names = [v.name for v in voices]
+    assert len(set(names)) == len(names)  # no duplicates
+    # Both genders, or casting cannot tell two characters apart.
+    assert sum(v.gender == "female" for v in voices) >= 3
+    assert sum(v.gender == "male" for v in voices) >= 3
+
+
+def test_the_base_accents_come_first_and_are_plain(monkeypatch):
+    fake_espeak(monkeypatch)
+    voices = discover_espeak_voices("espeak-ng", "en")
+    assert [v.name for v in voices[:5]] == [
+        "en-029", "en-gb", "en-gb-scotland", "en-gb-x-gbclan", "en-us",
+    ]
+    assert {v.accent for v in voices[:5]} == {"029", "gb", "us"}
+
+
+def test_only_the_asked_for_language_is_offered(monkeypatch):
+    """`af` is in the listing and must not be cast in an English film."""
+    fake_espeak(monkeypatch)
+    voices = discover_espeak_voices("espeak-ng", "en")
+    assert not any(v.name.startswith("af") for v in voices)
+
+
+def test_variants_are_combined_with_the_base_accents(monkeypatch):
+    fake_espeak(monkeypatch)
+    names = [v.name for v in discover_espeak_voices("espeak-ng", "en")]
+    combined = [n for n in names if "+" in n]
+    assert combined, "no variant voices were built"
+    assert all(n.split("+")[0].startswith("en") for n in combined)
+    # Variants are spread across accents rather than all applied to one.
+    assert len({n.split("+")[0] for n in combined}) > 1
+
+
+def test_a_variants_gender_overrides_the_bases(monkeypatch):
+    fake_espeak(monkeypatch)
+    by_name = {v.name: v for v in discover_espeak_voices("espeak-ng", "en")}
+    female = [v for name, v in by_name.items() if "+f" in name or "+Annie" in name]
+    assert female and all(v.gender == "female" for v in female)
+
+
+def test_novelty_variants_are_kept_out_of_the_pool(monkeypatch):
+    """A croaking robot is not a performer."""
+    fake_espeak(monkeypatch)
+    names = [v.name for v in discover_espeak_voices("espeak-ng", "en")]
+    for junk in ("croak", "whisper", "robosoft"):
+        assert not any(junk in n for n in names)
+
+
+def test_the_pool_is_capped_so_doctor_stays_readable(monkeypatch):
+    from video_gen.casting import MAX_ESPEAK_VOICES
+
+    many = ESPEAK_VARIANTS + "".join(
+        f" 5  variant          -/M      extra{i}            !v/extra{i}\n" for i in range(200)
+    )
+    fake_espeak(monkeypatch, variants=many)
+    assert len(discover_espeak_voices("espeak-ng", "en")) == MAX_ESPEAK_VOICES
+
+
+def test_an_unparseable_listing_still_yields_one_working_voice(monkeypatch):
+    """One voice beats zero: zero means a silent film."""
+    fake_espeak(monkeypatch, en="totally unexpected output")
+    voices = discover_espeak_voices("espeak-ng", "en")
+    assert len(voices) == 1 and voices[0].name == "en"
+
+
+def test_espeak_voices_cast_distinctly(monkeypatch):
+    """The pool is only useful if two characters end up on different voices."""
+    fake_espeak(monkeypatch)
+    pool = discover_espeak_voices("espeak-ng", "en")
+    cast = [
+        Character("Maya", description="A sharp young woman."),
+        Character("Jonas", description="An older man, cautious."),
+        Character("Ada", description="A woman in her thirties."),
+    ]
+    cast_production(cast, pool)
+    chosen = [c.voice.voice for c in cast]
+    assert all(chosen) and len(set(chosen)) == 3
+
+
+# -- the stub binary: proves -v reaches the synthesiser --------------------- #
+
+
+@pytest.fixture
+def stub_espeak(tmp_path, monkeypatch):
+    """A fake espeak-ng on PATH that logs its argv and writes a real wav."""
+    binary = tmp_path / "bin" / "espeak-ng"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "argv.log"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, wave, math, struct\n"
+        f"open({str(log)!r}, 'a').write('\\t'.join(sys.argv[1:]) + '\\n')\n"
+        "argv = sys.argv[1:]\n"
+        "if any(a.startswith('--voices') for a in argv):\n"
+        f"    sel = [a for a in argv if a.startswith('--voices')][0].split('=')[1]\n"
+        f"    sys.stdout.write({ESPEAK_VARIANTS!r} if sel == 'variant' else {ESPEAK_EN!r})\n"
+        "    sys.exit(0)\n"
+        "out = argv[argv.index('-w') + 1]\n"
+        "with wave.open(out, 'wb') as h:\n"
+        "    h.setnchannels(1); h.setsampwidth(2); h.setframerate(22050)\n"
+        "    h.writeframes(b''.join(struct.pack('<h', int(12000 * math.sin(i / 8.0)))\n"
+        "                           for i in range(11025)))\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    # Prepended rather than replacing PATH: the stub's own interpreter has to
+    # stay reachable, and the espeak branch is forced below regardless.
+    monkeypatch.setenv("PATH", f"{binary.parent}{os.pathsep}{os.environ['PATH']}")
+    # system_tts_command prefers `say` on darwin, so force the espeak branch.
+    monkeypatch.setattr("video_gen.casting.sys.platform", "linux")
+    return log
+
+
+def test_the_espeak_path_synthesises_audible_speech(stub_espeak, tmp_path):
+    from video_gen.casting import system_tts_command
+
+    assert system_tts_command() == "espeak-ng"
+    speech = SpeechSynthesizer(allow_neural=False)
+    assert speech.command == "espeak-ng"
+    ok, detail = speech.probe(tmp_path / "probe.wav")
+    assert ok, detail
+    assert speech.voiced_lines == 1 and speech.silent_lines == 0
+
+
+def test_the_cast_voice_is_passed_to_espeak(stub_espeak, tmp_path):
+    """Without -v every character on Linux spoke in the default voice."""
+    speech = SpeechSynthesizer(allow_neural=False)
+    speech.speak("Hello there.", VoiceProfile(voice="en-gb+f3", rate=1.1, pitch=-2.0), tmp_path / "a.wav")
+    argv = stub_espeak.read_text().strip().splitlines()[-1].split("\t")
+    assert "-v" in argv
+    assert argv[argv.index("-v") + 1] == "en-gb+f3"
+    # Rate and pitch still reach it too.
+    assert "-s" in argv and "-p" in argv
+
+
+def test_two_characters_on_linux_get_two_different_voices(stub_espeak, tmp_path):
+    """End to end on the espeak path: discovery, casting and synthesis."""
+    from video_gen.casting import discover_voices as discover
+
+    pool = discover()
+    assert len(pool) > 5
+    cast = [
+        Character("Maya", description="A sharp young woman."),
+        Character("Jonas", description="An older man."),
+    ]
+    cast_production(cast, pool)
+    assert cast[0].voice.voice != cast[1].voice.voice
+
+    speech = SpeechSynthesizer(allow_neural=False)
+    for index, member in enumerate(cast):
+        speech.speak("A line of dialogue.", member.voice, tmp_path / f"{index}.wav")
+    assert speech.voiced_lines == 2 and speech.silent_lines == 0
+    used = [
+        line.split("\t")[line.split("\t").index("-v") + 1]
+        for line in stub_espeak.read_text().strip().splitlines()
+        if "-v" in line.split("\t")
+    ]
+    assert len(set(used)) == 2
+
+
+# --------------------------------------------------------------------------- #
+# The agent contract
+#
+# An agent reads the exit code, then the JSON. Both are promises, so both are
+# tested as promises rather than as whatever the code happens to do.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_exit_codes_are_distinct_and_named():
+    codes = [EXIT_OK, EXIT_USAGE, EXIT_NO_AUDIO, EXIT_FAILED, EXIT_CANCELLED]
+    assert codes == [0, 1, 2, 3, 4]
+    assert len(set(codes)) == len(codes)
+    assert all(code in agent.EXIT_MEANINGS for code in codes)
+
+
+def test_every_payload_carries_the_keys_a_caller_branches_on():
+    payload = CommandResult(EXIT_OK, {"output": "x.mp4"}).payload("create")
+    assert payload["schema"] == agent.SCHEMA
+    assert payload["command"] == "create"
+    assert payload["ok"] is True
+    assert payload["exit_code"] == 0
+    assert payload["status"] == "ok"
+    # Present and null rather than absent, so a caller never has to use .get().
+    assert payload["error"] is None
+    assert payload["output"] == "x.mp4"
+
+
+def test_a_failure_payload_says_why():
+    payload = agent.fail(EXIT_FAILED, "ffmpeg died", id="t1").payload("render")
+    assert payload["ok"] is False
+    assert payload["exit_code"] == EXIT_FAILED
+    assert payload["status"] == "render failed"
+    assert payload["error"] == "ffmpeg died"
+    assert payload["id"] == "t1"
+
+
+def test_a_payload_is_json_serialisable_and_has_no_paths_in_it():
+    """json.dump with default=str would hide a Path; the contract says string."""
+    production = sample_production()
+    payload = agent.production_payload(production, Path("video_scripts/t1.md"))
+    encoded = json.dumps(payload)  # no default= : must already be plain types
+    assert "t1.md" in encoded
+    assert isinstance(payload["screenplay"], str)
+    assert Path(payload["screenplay"]).is_absolute()
+
+
+def test_the_screenplay_payload_carries_the_whole_script():
+    production = sample_production()
+    payload = agent.production_payload(production)
+    assert payload["shot_count"] == len(production.shots)
+    assert payload["scene_count"] == len(production.scenes)
+    assert [c["name"] for c in payload["cast"]] == [c.name for c in production.cast]
+    lines = [l for s in payload["scenes"] for sh in s["shots"] for l in sh["lines"]]
+    assert lines and all({"character", "text", "narration"} <= set(l) for l in lines)
+    # Enough to re-stage a shot without opening the markdown.
+    shot = payload["scenes"][0]["shots"][0]
+    assert {"shot_type", "camera", "subjects", "duration_s"} <= set(shot)
+
+
+def test_a_listing_row_is_a_summary_not_a_whole_script():
+    payload = agent.production_summary(sample_production())
+    assert "scenes" not in payload
+    assert {"id", "title", "production_status", "shot_count"} <= set(payload)
+
+
+def test_a_command_can_never_redefine_an_envelope_key():
+    """`status` is the outcome. A production's own status needed another name."""
+    payload = CommandResult(EXIT_OK, {"status": "accepted", "ok": "nope"}).payload("show")
+    assert payload["status"] == "ok"
+    assert payload["ok"] is True
+    assert payload["data_status"] == "accepted"
+    assert payload["data_ok"] == "nope"
+
+
+def test_the_render_payload_reports_silence_as_prominently_as_success():
+    production = sample_production()
+    production.renders.append({"duration_s": 9.5, "backend": "procedural"})
+    payload = agent.render_payload(
+        production, output=Path("out.mp4"), elapsed_s=12.0,
+        voiced_lines=0, silent_lines=4, screenplay=Path("s.md"),
+    )
+    assert payload["voiced_lines"] == 0
+    assert payload["silent_lines"] == 4
+    assert payload["duration_s"] == 9.5
+
+
+def test_the_doctor_payload_answers_what_an_agent_must_decide_on():
+    from video_gen.casting import discover_voices as discover
+
+    payload = agent.doctor_payload(
+        config=GenerationConfig(), voices=discover(), speech_ok=True,
+        speech_detail="fine", llm_describe="none", llm_probe=None,
+        visual_rows=[], music_rows=[], provider_rows=[],
+        selected_visual="procedural", selected_music="procedural",
+    )
+    assert {"render", "speech", "write_dialogue", "hosted_music", "hosted_speech"} == set(
+        payload["capabilities"]
+    )
+    assert payload["capabilities"]["write_dialogue"] is False  # "none"
+    assert payload["version"]
+    # The vocabulary an agent needs to build a valid command.
+    assert set(payload["formats"]) == set(FORMATS)
+    assert set(payload["aspects"]) == set(ASPECTS)
+    assert set(payload["styles"]) == set(STYLE_TIERS)
+    assert json.dumps(payload)
+
+
+# -- the parser ------------------------------------------------------------- #
+
+
+def test_the_prompt_flag_exists_and_is_not_the_prompt_file_flag():
+    """Documented in --help since v1; argparse abbreviated it to --prompt-file
+    and the run died on FileNotFoundError."""
+    from video_gen.cli import build_parser
+
+    args = build_parser().parse_args(["--prompt", "a 30s advert for a bike shop"])
+    assert args.prompt == "a 30s advert for a bike shop"
+    assert args.prompt_file is None
+
+
+def test_every_prompt_form_reaches_the_same_place():
+    from video_gen.cli import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["a story"]).prompt_positional == "a story"
+    assert parser.parse_args(["--prompt", "a story"]).prompt == "a story"
+    assert parser.parse_args(["--prompt-file", "s.txt"]).prompt_file == Path("s.txt")
+
+
+def test_json_implies_yes_so_nothing_can_block_on_a_prompt(monkeypatch):
+    """An agent cannot answer `Render now? [Y/n]`."""
+    from video_gen import cli
+
+    monkeypatch.setattr(cli, "dispatch", lambda args: CommandResult(EXIT_OK, {}))
+    seen = {}
+    monkeypatch.setattr(cli, "_command_name", lambda args: seen.setdefault("yes", args.yes) and "x")
+    cli.main(["--json", "--doctor"])
+    assert seen["yes"] is True
+
+
+def test_the_help_epilogue_only_advertises_flags_that_exist():
+    """The --prompt bug shipped because the epilogue was never checked."""
+    import re as _re
+
+    from video_gen.cli import build_parser
+
+    parser = build_parser()
+    known = {action.option_strings[0] for action in parser._actions if action.option_strings}
+    advertised = set(_re.findall(r"(?<!\w)(--[a-z][a-z-]+)", parser.epilog or ""))
+    assert advertised <= known, f"documented but undefined: {sorted(advertised - known)}"
+
+
+# --------------------------------------------------------------------------- #
+# The CLI as an agent actually calls it
+#
+# Through a real subprocess, because the promise is about stdout, stderr and
+# the exit code of a process -- not about what a function returns in-process.
+# --------------------------------------------------------------------------- #
+
+import subprocess
+
+
+def run_cli(*argv, cwd=None, expect=None):
+    """Invoke the CLI the way an agent would and parse stdout as JSON."""
+    done = subprocess.run(
+        [sys.executable, "-m", "video_gen", "--json", *argv],
+        cwd=str(cwd or Path(__file__).parent),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    payload = json.loads(done.stdout)  # must be the only thing on stdout
+    if expect is not None:
+        assert done.returncode == expect, f"exit {done.returncode}: {done.stdout}\n{done.stderr}"
+    return done, payload
+
+
+@pytest.fixture
+def sandbox(tmp_path):
+    """A working directory with nothing of the project's own state in it."""
+    for name in ("output", "video_scripts", "characters", ".cache"):
+        (tmp_path / name).mkdir()
+    return tmp_path
+
+
+@pytest.mark.slow
+def test_stdout_carries_only_json_and_the_log_goes_to_stderr(sandbox):
+    """A single stray print on stdout corrupts the payload at the caller."""
+    done, payload = run_cli("--doctor", cwd=sandbox, expect=EXIT_OK)
+    assert payload["command"] == "doctor"
+    assert done.stdout.lstrip().startswith("{")
+    assert done.stdout.rstrip().endswith("}")
+    # The human report really was produced -- just not on stdout.
+    assert "CAPABILITY REPORT" in done.stderr
+    assert "CAPABILITY REPORT" not in done.stdout
+
+
+@pytest.mark.slow
+def test_doctor_reports_capabilities_an_agent_can_branch_on(sandbox):
+    _, payload = run_cli("--doctor", cwd=sandbox, expect=EXIT_OK)
+    able = payload["capabilities"]
+    assert able["render"] is True
+    assert isinstance(able["speech"], bool)
+    # Nothing paid may be on by default, in a fresh directory.
+    assert able["hosted_music"] is False
+    assert able["hosted_speech"] is False
+    assert payload["voices"]["castable"] >= 0
+
+
+@pytest.mark.slow
+def test_an_unknown_id_is_a_usage_error_not_a_traceback(sandbox):
+    done, payload = run_cli("--render", "no-such-id", cwd=sandbox, expect=EXIT_USAGE)
+    assert payload["ok"] is False
+    assert "no-such-id" in payload["error"]
+    assert "Traceback" not in done.stdout
+
+
+@pytest.mark.slow
+def test_a_missing_prompt_file_is_a_usage_error(sandbox):
+    _, payload = run_cli("--prompt-file", "nope.txt", cwd=sandbox, expect=EXIT_USAGE)
+    assert "nope.txt" in payload["error"]
+
+
+@pytest.mark.slow
+def test_an_empty_prompt_is_a_usage_error(sandbox):
+    _, payload = run_cli("--prompt", "   ", cwd=sandbox, expect=EXIT_USAGE)
+    assert payload["error"] == "no prompt given"
+
+
+@pytest.mark.slow
+def test_a_bad_backend_name_is_reported_as_json(sandbox):
+    _, payload = run_cli(
+        "--prompt", "MAYA: Hello there.", "--backend", "nonexistent",
+        "--output", str(sandbox / "x.mp4"), cwd=sandbox, expect=EXIT_FAILED,
+    )
+    assert payload["ok"] is False and payload["error"]
+
+
+@pytest.mark.slow
+def test_the_prompt_flag_runs_rather_than_crashing(sandbox):
+    """Regression: `--prompt` used to die with FileNotFoundError."""
+    _, payload = run_cli(
+        "--prompt", "a 30s advert for a bike shop", "--no-render",
+        cwd=sandbox, expect=EXIT_OK,
+    )
+    assert payload["command"] == "create"
+    assert payload["id"] and payload["shot_count"] >= 1
+
+
+@pytest.mark.slow
+def test_no_render_writes_a_screenplay_and_stops(sandbox):
+    _, payload = run_cli(
+        "--prompt-file", str(Path(__file__).parent / "examples" / "01_screenplay.txt"),
+        "--no-render", cwd=sandbox, expect=EXIT_OK,
+    )
+    assert payload["status"] == "ok"  # the command's outcome
+    assert payload["production_status"] == "accepted"  # the production's own
+    assert Path(payload["screenplay"]).is_file()
+    assert not list((sandbox / "output").glob("*.mp4"))
+    assert payload["title"] == "Control Room"  # not "INT"
+    assert [c["name"] for c in payload["cast"]] == ["Maya", "Jonas"]
+
+
+@pytest.mark.slow
+def test_list_and_show_round_trip_a_saved_production(sandbox):
+    _, written = run_cli(
+        "--prompt-file", str(Path(__file__).parent / "examples" / "01_screenplay.txt"),
+        "--no-render", cwd=sandbox, expect=EXIT_OK,
+    )
+    _, listing = run_cli("--list", cwd=sandbox, expect=EXIT_OK)
+    ids = [row["id"] for row in listing["productions"]]
+    assert written["id"] in ids
+
+    _, shown = run_cli("--show", written["id"], cwd=sandbox, expect=EXIT_OK)
+    assert shown["id"] == written["id"]
+    assert shown["shot_count"] == written["shot_count"]
+    spoken = [
+        line["text"]
+        for scene in shown["scenes"] for shot in scene["shots"] for line in shot["lines"]
+    ]
+    assert "The signal is back. Same rhythm as last night." in spoken
+
+
+@pytest.mark.slow
+def test_characters_lists_the_reusable_cast(sandbox):
+    run_cli(
+        "--prompt-file", str(Path(__file__).parent / "examples" / "01_screenplay.txt"),
+        "--no-render", cwd=sandbox, expect=EXIT_OK,
+    )
+    _, payload = run_cli("--characters", cwd=sandbox, expect=EXIT_OK)
+    names = [c["name"] for c in payload["characters"]]
+    assert "Maya" in names and "Jonas" in names
+    assert all("voice" in c for c in payload["characters"])
+
+
+@pytest.mark.slow
+def test_providers_reports_everything_off_in_a_fresh_directory(sandbox):
+    _, payload = run_cli("--providers", cwd=sandbox, expect=EXIT_OK)
+    assert payload["config_file"] is None
+    assert all(tier["ready"] is False for tier in payload["tiers"])
+    assert {"agensi", "lyria", "elevenlabs", "minimax"} <= {p["name"] for p in payload["presets"]}
+
+
+@pytest.mark.slow
+def test_a_configured_key_never_appears_in_a_payload(sandbox, monkeypatch):
+    """`--providers` is printed and logged, so the value must never be in it."""
+    env = dict(os.environ, ELEVENLABS_API_KEY="super-secret-sentinel")
+    done = subprocess.run(
+        [sys.executable, "-m", "video_gen", "--json", "--providers"],
+        cwd=str(sandbox), capture_output=True, text=True, timeout=300, env=env,
+    )
+    assert done.returncode == EXIT_OK
+    assert "super-secret-sentinel" not in done.stdout
+    assert "super-secret-sentinel" not in done.stderr
+    payload = json.loads(done.stdout)
+    spec = next(p for p in payload["presets"] if p["name"] == "elevenlabs")
+    assert spec["api_key_present"] is True  # found, and still not disclosed
+
+
+@pytest.mark.slow
+def test_init_providers_scaffolds_a_disabled_config(sandbox):
+    _, payload = run_cli("--init-providers", cwd=sandbox, expect=EXIT_OK)
+    written = Path(payload["path"])
+    assert written.is_file() and payload["enabled"] is False
+
+    _, again = run_cli("--init-providers", cwd=sandbox, expect=EXIT_USAGE)
+    assert "already exists" in again["error"]
+
+    # And the written file really does leave everything off.
+    _, status = run_cli("--providers", cwd=sandbox, expect=EXIT_OK)
+    assert all(tier["ready"] is False for tier in status["tiers"])
+
+
+@pytest.mark.slow
+def test_version_is_reported(sandbox):
+    done = subprocess.run(
+        [sys.executable, "-m", "video_gen", "--version"],
+        cwd=str(sandbox), capture_output=True, text=True, timeout=120,
+    )
+    from video_gen import __version__
+
+    assert __version__ in done.stdout + done.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Exit code 2: a film came out and nobody can hear it
+#
+# The failure this guards is the nastiest one in the project. The MP4 is the
+# right length, has real subtitles and plays silence, so an agent that only
+# checks "did a file appear" hands over a broken video.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def no_synthesiser(monkeypatch):
+    """A machine with no TTS at all, as a bare Linux container would be."""
+    monkeypatch.setattr("video_gen.casting.system_tts_command", lambda: None)
+    monkeypatch.setattr("video_gen.speech.system_tts_command", lambda: None)
+
+
+@pytest.mark.slow
+def test_a_silent_render_exits_two_not_zero(config, no_synthesiser):
+    from video_gen.cli import command_self_test
+
+    result = command_self_test(config, config.output_dir / "silent.mp4")
+    assert result.code == EXIT_NO_AUDIO
+    assert result.ok is False
+    # A real file really was produced -- that is what makes this dangerous.
+    assert Path(result.data["output"]).is_file()
+    assert result.data["voiced_lines"] == 0
+    assert result.data["silent_lines"] > 0
+    assert "no audio" in result.data["error"].lower()
+
+
+@pytest.mark.slow
+def test_the_silent_payload_says_so_in_the_envelope_too(config, no_synthesiser):
+    from video_gen.cli import command_self_test
+
+    payload = command_self_test(config, config.output_dir / "s.mp4").payload("self-test")
+    assert payload["ok"] is False
+    assert payload["exit_code"] == EXIT_NO_AUDIO
+    assert payload["status"] == "rendered with no audible dialogue"
+    assert payload["error"]
+
+
+@pytest.mark.slow
+def test_a_render_with_sound_exits_zero(config):
+    from video_gen.cli import command_self_test
+
+    result = command_self_test(config, config.output_dir / "loud.mp4")
+    if not SpeechSynthesizer().available:
+        pytest.skip("no synthesiser on this machine, so there is nothing to compare")
+    assert result.code == EXIT_OK
+    assert result.data["voiced_lines"] > 0
+    assert result.data["silent_lines"] == 0
+    assert result.payload("self-test")["error"] is None
+
+
+@pytest.mark.slow
+def test_the_renderer_counts_silence_rather_than_pretending(config, no_synthesiser):
+    production = sample_production()
+    with FilmRenderer(config, registry=BackendRegistry([ProceduralBackend(config)])) as film:
+        film.render(production)
+    record = production.renders[-1]
+    assert record["voiced_lines"] == 0
+    assert record["silent_lines"] > 0
+
+
+# --------------------------------------------------------------------------- #
+# The renderer and the music seam
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.slow
+def test_the_renderer_records_which_backend_scored_the_film(config):
+    production = sample_production()
+    with FilmRenderer(config, registry=BackendRegistry([ProceduralBackend(config)])) as film:
+        film.render(production)
+        assert film.score_backend == "procedural"
+    assert production.renders[-1]["score_backend"] == "procedural"
+
+
+@pytest.mark.slow
+def test_the_renderer_uses_the_music_registry_it_is_given(config):
+    mock = MockMusic(sample_rate=11025)
+    production = sample_production()
+    with FilmRenderer(
+        config,
+        registry=BackendRegistry([ProceduralBackend(config)]),
+        music_registry=MusicRegistry([mock, ProceduralMusic()]),
+    ) as film:
+        film.render(production)
+        assert film.score_backend == "mock"
+    assert mock.calls == 1
+    # The request carried the real timeline, not a placeholder.
+    request = mock.requests[0]
+    assert request.total_duration > 0
+    assert request.segments and all(len(s) == 3 for s in request.segments)
+    assert request.format == production.format
+
+
+@pytest.mark.slow
+def test_a_failing_score_backend_still_produces_a_film(config):
+    """The guarantee, end to end through the renderer."""
+    production = sample_production()
+    with FilmRenderer(
+        config,
+        registry=BackendRegistry([ProceduralBackend(config)]),
+        music_registry=MusicRegistry([MockMusic(fail=True), ProceduralMusic()]),
+    ) as film:
+        path = film.render(production)
+        assert film.score_backend == "procedural"
+    assert path.is_file() and path.stat().st_size > 5_000
+
+
+@pytest.mark.slow
+def test_no_music_skips_the_score_entirely(tmp_path):
+    """--no-music must not call a paid provider."""
+    silent_config = GenerationConfig(
+        preset="draft", resolution=(320, 180), fps=12, music=False,
+        output_dir=tmp_path / "o", scripts_dir=tmp_path / "s",
+        characters_dir=tmp_path / "c", cache_dir=tmp_path / "k",
+    )
+    mock = MockMusic()
+    production = sample_production()
+    with FilmRenderer(
+        silent_config,
+        registry=BackendRegistry([ProceduralBackend(silent_config)]),
+        music_registry=MusicRegistry([mock]),
+    ) as film:
+        film.render(production)
+    assert mock.calls == 0
+    assert film.score_backend == ""
+
+
+@pytest.mark.slow
+def test_a_scene_mood_reaches_the_score_request(config):
+    mock = MockMusic()
+    production = sample_production()
+    production.scenes[0].mood = "urgent"
+    with FilmRenderer(
+        config,
+        registry=BackendRegistry([ProceduralBackend(config)]),
+        music_registry=MusicRegistry([mock]),
+    ) as film:
+        film.render(production)
+    assert "urgent" in mock.requests[0].moods
+
+
+# --------------------------------------------------------------------------- #
+# Hosted speech
+# --------------------------------------------------------------------------- #
+
+
+def test_a_hosted_voice_round_trips_through_the_screenplay():
+    profile = VoiceProfile(voice="Kathy", hosted_voice="abc123")
+    assert VoiceProfile.from_dict(profile.to_dict()).hosted_voice == "abc123"
+
+
+def test_an_unset_hosted_voice_is_not_written_to_the_file():
+    """Every screenplay written before this field existed must round-trip
+    unchanged, byte for byte."""
+    assert "hosted_voice" not in VoiceProfile(voice="Kathy").to_dict()
+    production = sample_production()
+    cast_production(production.cast, POOL)
+    assert "hosted_voice" not in production.to_markdown()
+
+
+def test_hosted_voices_are_dealt_round_robin_and_deterministically():
+    cast = [Character("Maya"), Character("Jonas"), Character("Ada")]
+    cast_production(cast, POOL, hosted_voices=["v1", "v2"])
+    assigned = {c.name: c.voice.hosted_voice for c in cast}
+    assert set(assigned.values()) == {"v1", "v2"}
+
+    again = [Character("Maya"), Character("Jonas"), Character("Ada")]
+    cast_production(again, POOL, hosted_voices=["v1", "v2"])
+    assert {c.name: c.voice.hosted_voice for c in again} == assigned
+
+
+def test_a_system_voice_is_cast_alongside_the_hosted_one():
+    """Switching the paid tier back off must not mute the cast."""
+    cast = [Character("Maya"), Character("Jonas")]
+    cast_production(cast, POOL, hosted_voices=["v1", "v2"])
+    assert all(c.voice.voice for c in cast)
+    assert all(c.voice.hosted_voice for c in cast)
+
+
+def test_a_hand_set_hosted_voice_is_never_overwritten():
+    cast = [Character("Maya", voice=VoiceProfile(voice="Kathy", hosted_voice="mine"))]
+    cast_production(cast, POOL, hosted_voices=["v1"])
+    assert cast[0].voice.hosted_voice == "mine"
+
+
+def test_hosted_speech_is_off_without_a_config():
+    assert SpeechSynthesizer().hosted is None
+    assert SpeechSynthesizer(config=GenerationConfig()).hosted is None
+
+
+def test_hosted_speech_is_off_without_a_key(tmp_path):
+    spec = providers.ProviderSpec(
+        name="tts", tier=providers.SPEECH, endpoint="https://e",
+        api_key_env="NOT_SET_ANYWHERE_98765",
+    )
+    config = GenerationConfig(cache_dir=tmp_path)
+    config._providers = providers.ProvidersConfig(
+        enabled={providers.MUSIC: False, providers.SPEECH: True},
+        selected={providers.MUSIC: "", providers.SPEECH: "tts"},
+        specs={"tts": spec},
+    )
+    assert SpeechSynthesizer(config=config).hosted is None
+
+
+def hosted_speech_config(tmp_path, voices=("v1", "v2")):
+    spec = providers.ProviderSpec(
+        name="tts",
+        tier=providers.SPEECH,
+        endpoint="https://example.test/tts/{voice}",
+        api_key="k",
+        auth_header="x-api-key",
+        auth_prefix="",
+        body={"text": "{text}"},
+        response="audio",
+        voices=list(voices),
+    )
+    config = GenerationConfig(
+        preset="draft", resolution=(320, 180), fps=12,
+        output_dir=tmp_path / "o", scripts_dir=tmp_path / "s",
+        characters_dir=tmp_path / "c", cache_dir=tmp_path / "k",
+    )
+    config._providers = providers.ProvidersConfig(
+        enabled={providers.MUSIC: False, providers.SPEECH: True},
+        selected={providers.MUSIC: "", providers.SPEECH: "tts"},
+        specs={"tts": spec},
+    )
+    return config
+
+
+def test_hosted_speech_speaks_a_line_and_uses_the_characters_voice_id(
+    tmp_path, wav_bytes, monkeypatch
+):
+    config = hosted_speech_config(tmp_path)
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode())
+        return FakeResponse(wav_bytes, "audio/wav")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    speech = SpeechSynthesizer(allow_neural=False, config=config)
+    assert speech.hosted is not None
+
+    path, duration = speech.speak(
+        "Hello there.", VoiceProfile(hosted_voice="voice-42"), tmp_path / "a.wav"
+    )
+    assert captured["url"] == "https://example.test/tts/voice-42"
+    assert captured["body"]["text"] == "Hello there."
+    assert duration > 0 and Path(path).is_file()
+    assert speech.voiced_lines == 1 and speech.silent_lines == 0
+    assert speech.engine_name == "hosted:tts"
+
+
+def test_hosted_speech_falls_back_to_the_system_voice_on_failure(tmp_path, monkeypatch):
+    """A provider outage must not mute the film."""
+    import urllib.error
+
+    config = hosted_speech_config(tmp_path)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout=None: (_ for _ in ()).throw(urllib.error.URLError("down")),
+    )
+    speech = SpeechSynthesizer(allow_neural=False, config=config)
+    if speech.command is None:
+        pytest.skip("no system synthesiser to fall back to")
+    speech.speak("Hello there.", VoiceProfile(voice=POOL[0].name), tmp_path / "a.wav")
+    assert speech.voiced_lines == 1
+    assert speech.engine_name == speech.command
+    assert any("down" in f for f in speech.failures)
+
+
+@pytest.mark.slow
+def test_one_hosted_failure_disables_the_tier_for_the_rest_of_the_render(tmp_path, monkeypatch):
+    """Paying for a dead provider once per line is worse than falling back."""
+    import urllib.error
+
+    config = hosted_speech_config(tmp_path)
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(1)
+        raise urllib.error.URLError("down")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    speech = SpeechSynthesizer(allow_neural=False, config=config)
+    for index in range(4):
+        speech.speak("A line.", VoiceProfile(voice=POOL[0].name), tmp_path / f"{index}.wav")
+    assert len(calls) == 1
+    assert speech.hosted is None
+
+
+# --------------------------------------------------------------------------- #
+# Two defects found while writing the worked examples
+# --------------------------------------------------------------------------- #
+
+
+def test_a_screenplay_is_not_titled_INT():
+    """`split_sentences` ends the first sentence at the abbreviation's full
+    stop, so every script used to be called "INT"."""
+    script = "INT. CONTROL ROOM - NIGHT\n\nMAYA: Hello.\n"
+    assert Screenwriter.derive_title(script) == "Control Room"
+    assert Screenwriter.derive_title("EXT. CAR PARK - DAY\n\nJONAS: Hi.\n") == "Car Park"
+
+
+def test_an_explicit_title_still_wins_over_the_slugline():
+    script = "Title: The Signal\n\nINT. CONTROL ROOM - NIGHT\n\nMAYA: Hello.\n"
+    assert Screenwriter.derive_title(script) == "The Signal"
+
+
+def test_prose_and_briefs_are_titled_as_before():
+    """The slugline path must not capture anything that is not a screenplay."""
+    assert Screenwriter.derive_title("Maya ran the night shift.") == "Maya ran the night shift"
+    brief = "A 20 second vertical advert for Kestrel Coffee, a small roastery."
+    assert Screenwriter.derive_title(brief).startswith("Kestrel Coffee")
+
+
+def test_a_slugline_with_no_location_falls_through():
+    assert Screenwriter.derive_title("INT.\n\nMAYA: Hello.\n") != ""
+
+
+def test_a_wrapped_line_does_not_carry_its_line_break_into_a_caption():
+    """Prose wrapped at 80 columns rendered a stray break mid-sentence."""
+    line = Line("Maya", "We are out\nof time, and the\ttrace is climbing.")
+    assert line.text == "We are out of time, and the trace is climbing."
+    assert "\n" not in line.text
+
+
+def test_whitespace_is_normalised_in_delivery_too():
+    assert Line("Maya", "Hi.", delivery="very\n quietly").delivery == "very quietly"
+
+
+def test_narration_parsed_from_wrapped_prose_is_clean():
+    prose = (
+        "Maya had run the night shift for three years, and she had never seen\n"
+        "the trace climb like this. Jonas leaned over the console beside her.\n"
+    )
+    production = Screenwriter().write(prose, StoryMeta(title="Wrapped"))
+    texts = [line.text for shot in production.shots for line in shot.lines]
+    assert texts
+    assert all("\n" not in text for text in texts)
