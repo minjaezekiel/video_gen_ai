@@ -70,9 +70,13 @@ class VoiceProfile:
     pitch: float = 0.0  # semitones
     gender: str = "unknown"  # male | female | neutral | unknown
     age: str = "adult"  # child | young | adult | elder
+    #: A hosted provider's own voice id, when the paid speech tier is on. Kept
+    #: separate from ``voice`` so switching the tier off restores the system
+    #: voice this character was already cast with, rather than muting them.
+    hosted_voice: str = ""
 
     def to_dict(self) -> Dict[str, object]:
-        return {
+        data: Dict[str, object] = {
             "engine": self.engine,
             "voice": self.voice,
             "rate": round(self.rate, 3),
@@ -80,6 +84,11 @@ class VoiceProfile:
             "gender": self.gender,
             "age": self.age,
         }
+        # Omitted when unset so every existing screenplay round-trips to the
+        # same bytes it did before this field existed.
+        if self.hosted_voice:
+            data["hosted_voice"] = self.hosted_voice
+        return data
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, object]]) -> "VoiceProfile":
@@ -91,6 +100,7 @@ class VoiceProfile:
             pitch=float(data.get("pitch", 0.0) or 0.0),
             gender=str(data.get("gender", "unknown")),
             age=str(data.get("age", "adult")),
+            hosted_voice=str(data.get("hosted_voice", "") or ""),
         )
 
 
@@ -165,6 +175,14 @@ class Line:
     character: str  # character name, or NARRATOR
     text: str
     delivery: str = ""  # parenthetical: (whispering), (excited)
+
+    def __post_init__(self) -> None:
+        # Prose wrapped at 80 columns carries its line breaks into the text,
+        # which the synthesiser ignores but a burned-in caption renders as a
+        # stray break mid-sentence. Normalising here fixes it for captions, the
+        # markdown round-trip and the JSON payload at once.
+        self.text = " ".join(str(self.text).split())
+        self.delivery = " ".join(str(self.delivery).split())
 
     @property
     def key(self) -> str:

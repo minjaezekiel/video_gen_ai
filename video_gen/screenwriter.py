@@ -799,6 +799,23 @@ class Screenwriter:
             stripped = line.strip()
             if stripped.lower().startswith("title:"):
                 return stripped.split(":", 1)[1].strip() or "Untitled"
+
+        # A screenplay's first "sentence" is "INT." -- the abbreviation's full
+        # stop looks like a sentence boundary -- which titled every script
+        # "INT". The first slugline's location is what the opening scene is
+        # actually called, so use that.
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            match = _SLUGLINE_RE.match(stripped)
+            if not match:
+                break  # not a screenplay; fall through to the prose path
+            location = (match.group("location") or "").strip(" .-")
+            if location:
+                return " ".join(location.title().split()[:8])
+            break
+
         first = (split_sentences(text) or [text])[0].strip()
         # "A 20 second vertical advert for Kestrel Coffee" is a brief; the title
         # is what it is *for*, not the instruction wrapped around it.

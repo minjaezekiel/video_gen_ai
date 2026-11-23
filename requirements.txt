@@ -1,31 +1,32 @@
 # Core requirements -- these alone are enough to run the full pipeline
-# (script generation, TTS fallback, Ken Burns animation, encoding).
+# (screenplay generation, per-character TTS, score, captions, encoding).
 # The AI models are OPTIONAL; see requirements-ml.txt.
 #
 #   pip install -r requirements.txt          # always works, fully offline
 #   pip install -r requirements-ml.txt       # adds Stable Diffusion + neural TTS
+#
+# Or, equivalently:  pip install -e .   /   pip install -e ".[ml]"
+#
+# Nothing here reaches the network at run time. Every dependency below is
+# imported by the package; anything that stopped being imported has been
+# removed rather than left to inflate the install.
 
 # --- video ---
 # moviepy 2.x: `moviepy.editor` was removed, and 1.0.3 does not work on py3.13.
 moviepy>=2.1
-# Ships a static ffmpeg binary, so no system ffmpeg install is required.
+# Ships a static ffmpeg binary, so no system ffmpeg install is required. Also
+# what decodes audio returned by an opt-in hosted music provider.
 imageio-ffmpeg>=0.5
 imageio>=2.34
 
 # --- audio ---
 soundfile>=0.12
-scipy>=1.11
 
 # --- core ---
 numpy>=1.26,<3
 pillow>=10.0
+# Screenplay frontmatter, the character store, and providers.yaml.
 PyYAML>=6.0
-requests>=2.31
-# The macOS python.org build ships no root certificates; without this, every
-# HTTPS call (including Hugging Face downloads) fails CERTIFICATE_VERIFY_FAILED.
-certifi>=2024.2.2
-beautifulsoup4>=4.12
-tqdm>=4.66
 
 # --- dev ---
 pytest>=8.0

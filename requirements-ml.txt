@@ -21,3 +21,9 @@ diffusers>=0.31
 accelerate>=0.30
 huggingface-hub>=0.24
 safetensors>=0.4
+
+# The macOS python.org build ships no root certificates; without this, the
+# Hugging Face model downloads this file enables fail with
+# CERTIFICATE_VERIFY_FAILED. Only needed once models are in play, which is why
+# it lives here rather than in requirements.txt.
+certifi>=2024.2.2
