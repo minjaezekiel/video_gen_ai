@@ -211,6 +211,7 @@ def render_payload(
     score_backend: str = "",
     speech_engine: str = "",
     visual_backend: str = "",
+    subtitle_files: Optional[Sequence[Path]] = None,
 ) -> Dict[str, Any]:
     """The result of a render: where the file is, and whether it has sound."""
     last = production.renders[-1] if production.renders else {}
@@ -229,6 +230,9 @@ def render_payload(
         "style": production.style,
         "aspect": production.aspect,
         "written_by": production.config.get("written_by") or None,
+        "subtitles": [_path(p) for p in (subtitle_files or [])] or last.get("subtitles") or [],
+        "audio_cache_hits": last.get("audio_cache_hits", 0),
+        "content_hash": last.get("content_hash"),
         "visual_backend": visual_backend or last.get("backend"),
         "score_backend": score_backend or last.get("score_backend"),
         "speech_engine": speech_engine or last.get("speech_engine"),
@@ -263,6 +267,8 @@ def doctor_payload(
     provider_rows: List[Dict[str, Any]],
     selected_visual: str,
     selected_music: str,
+    accelerator: Optional[Dict[str, Any]] = None,
+    workers: int = 1,
 ) -> Dict[str, Any]:
     """Everything an agent needs to decide what it can ask for on this machine.
 
@@ -302,6 +308,8 @@ def doctor_payload(
         "visual_backends": visual_rows,
         "music_backends": music_rows,
         "selected": {"visual": selected_visual, "music": selected_music},
+        "accelerator": accelerator or {"available": False},
+        "shot_workers": workers,
         "hosted_providers": provider_rows,
         "capabilities": {
             "render": True,
@@ -309,6 +317,9 @@ def doctor_payload(
             "write_dialogue": llm_describe != "none",
             "hosted_music": any(r["tier"] == "music" and r["ready"] for r in provider_rows),
             "hosted_speech": any(r["tier"] == "speech" and r["ready"] for r in provider_rows),
+            "native_accelerator": bool((accelerator or {}).get("available")),
+            "lip_sync": True,
+            "subtitles": True,
         },
         "formats": sorted(FORMATS),
         "styles": sorted(STYLE_TIERS),

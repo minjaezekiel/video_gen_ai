@@ -13,13 +13,16 @@ import argparse
 import contextlib
 import json
 import logging
+import os
+import shlex
+import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from . import llm
+from . import fastpath, llm
 from .agent import (
     EXIT_CANCELLED,
     EXIT_FAILED,
@@ -36,8 +39,8 @@ from .agent import (
 from .casting import cast_production, describe_pool, discover_voices
 from .config import ASPECTS, DEFAULT_PRESET, FORMATS, PRESETS, STYLE_TIERS, GenerationConfig
 from .interview import Interview, infer_meta
-from .model import Production
-from .render import FilmRenderer
+from .model import Character, Production
+from .render import FilmRenderer, is_current
 from .screenwriter import Screenwriter
 from .score import default_registry as default_music_registry
 from .speech import SpeechSynthesizer
@@ -163,6 +166,8 @@ def command_doctor(config: GenerationConfig) -> CommandResult:
     print("=" * 76)
     print(f"  python      : {sys.version.split()[0]} on {sys.platform}")
     print(f"  resolution  : {config.resolution[0]}x{config.resolution[1]} @ {config.fps}fps")
+    print(f"  accelerator : {fastpath.describe()}")
+    print(f"  shot workers: {config.worker_hint()}")
     print(f"  voices      : {describe_pool(voices)}")
     print(f"  speech      : {'OK  ' if speech_ok else 'FAIL'} {speech_detail}")
     if not speech_ok:
@@ -220,6 +225,8 @@ def command_doctor(config: GenerationConfig) -> CommandResult:
             provider_rows=provider_rows,
             selected_visual=selected_visual,
             selected_music=selected_music,
+            accelerator=fastpath.report(),
+            workers=config.worker_hint(),
         ),
     )
 
@@ -370,6 +377,143 @@ def command_cast(config: GenerationConfig, production_id: str) -> CommandResult:
     )
 
 
+def command_import_character(
+    config: GenerationConfig, name: str, image: str
+) -> CommandResult:
+    """Attach reference art to a character so a backend can condition on it."""
+    store = CharacterStore(config.characters_dir)
+    source = Path(image)
+    if not source.is_file():
+        print(f"No image at {source}")
+        return fail(EXIT_USAGE, f"no image at {source}")
+
+    member = store.find(name) or Character(name=name)
+    try:
+        member = store.import_reference(member, source)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not import {source}: {exc}")
+        return fail(EXIT_FAILED, f"could not import {source}: {exc}")
+
+    if not member.voice.voice:
+        # Cast now, so the character is usable the moment it exists rather than
+        # only once some production happens to include it.
+        cast_production([member], discover_voices(), hosted_voices=_hosted_voices(config))
+        store.save(member)
+
+    print(f"\n✓ {member.name}")
+    print(f"  reference : {member.reference_image}")
+    print(f"  voice     : {member.voice.voice or 'uncast'}")
+    print(f"  file      : {store.path_for(member.id)}")
+    print("\n  Identity conditioning needs a backend that supports it — see --doctor.")
+
+    from .agent import character_payload
+
+    return CommandResult(EXIT_OK, {"character": character_payload(member)})
+
+
+def command_edit(config: GenerationConfig, args: argparse.Namespace) -> CommandResult:
+    """Open a screenplay in $EDITOR, then render what came back."""
+    store = ProductionStore(config.scripts_dir)
+    try:
+        store.load(args.edit)
+    except Exception as exc:  # noqa: BLE001
+        print(f"No such production {args.edit!r}: {exc}")
+        return fail(EXIT_USAGE, f"no such production {args.edit!r}")
+
+    path = store.path_for(args.edit)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        print(f"\nNo $EDITOR set. The screenplay is at:\n  {path}")
+        return fail(
+            EXIT_USAGE, "no $EDITOR or $VISUAL set", screenplay=str(path.resolve())
+        )
+
+    before = path.read_bytes()
+    try:
+        subprocess.run([*shlex.split(editor), str(path)], check=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not run {editor!r}: {exc}")
+        return fail(EXIT_FAILED, f"could not run {editor!r}: {exc}")
+
+    try:
+        production = store.load(args.edit)
+    except Exception as exc:  # noqa: BLE001
+        # Better to say the file is now unparseable than to render a stale copy.
+        print(f"\n✗ {path} no longer parses: {exc}")
+        return fail(
+            EXIT_FAILED, f"{path} no longer parses: {exc}", screenplay=str(path.resolve())
+        )
+
+    if path.read_bytes() == before:
+        print("\nNo changes. Nothing to re-render.")
+        return CommandResult(
+            EXIT_OK, production_payload(production, path) | {"changed": False}
+        )
+
+    CharacterStore(config.characters_dir).merge_into(production)
+    print_screenplay(production)
+    return confirm_and_render(config, production, store, args.yes, args.output)
+
+
+def command_batch(config: GenerationConfig, args: argparse.Namespace) -> CommandResult:
+    """Render every saved production with a given status.
+
+    The point of pairing this with `--resume` is that a batch over a library
+    becomes cheap to repeat: anything already current is skipped, so a failed
+    run can simply be run again.
+    """
+    store = ProductionStore(config.scripts_dir)
+    wanted = str(args.batch).strip().lower()
+    productions = store.list_productions()
+    if wanted not in ("all", "*"):
+        productions = [p for p in productions if p.status.lower() == wanted]
+
+    if not productions:
+        print(f"\nNothing with status {wanted!r} in {config.scripts_dir}/")
+        # Same keys as a non-empty batch: a caller should not have to handle
+        # two shapes, and `status` would collide with the envelope's own.
+        return CommandResult(
+            EXIT_OK,
+            {
+                "batch_status": wanted,
+                "count": 0,
+                "rendered": 0,
+                "skipped": 0,
+                "productions": [],
+            },
+        )
+
+    print(f"\n{len(productions)} production(s) with status {wanted!r}\n")
+    results: List[dict] = []
+    worst = EXIT_OK
+    for position, production in enumerate(productions, start=1):
+        print(f"── [{position}/{len(productions)}] {production.id} — {production.title}")
+        target = config.output_dir / f"{production.id}.mp4"
+        CharacterStore(config.characters_dir).merge_into(production)
+        outcome = confirm_and_render(
+            config, production, store, True, target, resume=args.resume
+        )
+        results.append(
+            {"id": production.id, "skipped": bool(outcome.data.get("skipped")), **outcome.data}
+        )
+        # The batch reports the worst thing that happened, so one silent film
+        # in fifty cannot be mistaken for a clean run.
+        worst = max(worst, outcome.code)
+
+    rendered = sum(1 for r in results if not r.get("skipped"))
+    print(f"\n{rendered} rendered, {len(results) - rendered} skipped")
+    return CommandResult(
+        worst,
+        {
+            "batch_status": wanted,
+            "count": len(results),
+            "rendered": rendered,
+            "skipped": len(results) - rendered,
+            "productions": results,
+        },
+    )
+
+
 def _hosted_voices(config: GenerationConfig) -> List[str]:
     """The paid provider's voice ids, or nothing when the tier is off."""
     from .providers import SPEECH
@@ -386,9 +530,32 @@ def confirm_and_render(
     store: ProductionStore,
     assume_yes: bool,
     output: Optional[Path] = None,
+    resume: bool = False,
 ) -> CommandResult:
     name = output or ask("Output filename:", f"{production.id}.mp4") if not assume_yes else None
     target = Path(output) if output else config.output_dir / (name or f"{production.id}.mp4")
+
+    if resume and is_current(production, config, target):
+        # Identity is the screenplay's content plus the settings that change a
+        # pixel, not the file's mtime: an edit that only touched a comment must
+        # not force a re-render, and a changed --seed must.
+        print(f"\n✓ {target} is already current — nothing to do")
+        print("  (content, cast, preset, seed and aspect all unchanged)")
+        last = production.renders[-1] if production.renders else {}
+        return CommandResult(
+            EXIT_OK,
+            {
+                "id": production.id,
+                "title": production.title,
+                "output": str(target.resolve()),
+                "screenplay": str(store.path_for(production.id).resolve()),
+                "skipped": True,
+                "reason": "already current",
+                "duration_s": last.get("duration_s"),
+                "voiced_lines": last.get("voiced_lines"),
+                "silent_lines": last.get("silent_lines"),
+            },
+        )
 
     print(f"\n  {len(production.shots)} shots · ~{production.estimated_duration:.0f}s of video")
     if not assume_yes and is_interactive():
@@ -411,6 +578,8 @@ def confirm_and_render(
             score_backend = renderer.score_backend
             speech_engine = renderer.speech.engine_name
             visual_backend = renderer.backend.name
+            sidecars = list(renderer.subtitle_files)
+            cache_hits = renderer.speech.cache_hits
     except Exception as exc:  # noqa: BLE001 - report it, do not traceback at an agent
         LOGGER.error("render failed: %s", exc, exc_info=True)
         print(f"\n✗ render failed: {type(exc).__name__}: {exc}")
@@ -431,6 +600,10 @@ def confirm_and_render(
         print(f"  {voiced} line(s) voiced  ·  {cast}")
     if score_backend and score_backend != "procedural":
         print(f"  score: {score_backend}")
+    if cache_hits:
+        print(f"  {cache_hits} line(s) reused from the audio cache")
+    if sidecars:
+        print(f"  subtitles: {', '.join(p.name for p in sidecars)}")
     if silent:
         # Impossible to miss: this is the difference between a finished film and
         # one that plays subtitles over silence.
@@ -448,6 +621,7 @@ def confirm_and_render(
         score_backend=score_backend,
         speech_engine=speech_engine,
         visual_backend=visual_backend,
+        subtitle_files=sidecars,
     )
     # A film nobody can hear is not a success, and an agent must be able to see
     # that from the exit code alone rather than by reading a warning line.
@@ -500,6 +674,9 @@ def command_create(config: GenerationConfig, args: argparse.Namespace) -> Comman
         seed=config.seed,
         music=config.music,
         captions=config.captions,
+        subtitles=config.subtitles,
+        lip_sync=config.lip_sync,
+        jobs=config.jobs,
         backend=config.backend,
         music_backend=config.music_backend,
         providers_file=config.providers_file,
@@ -553,7 +730,9 @@ def command_create(config: GenerationConfig, args: argparse.Namespace) -> Comman
         return CommandResult(
             EXIT_OK, production_payload(production, store.path_for(production.id))
         )
-    return confirm_and_render(config, production, store, args.yes, args.output)
+    return confirm_and_render(
+        config, production, store, args.yes, args.output, resume=args.resume
+    )
 
 
 def command_render(config: GenerationConfig, args: argparse.Namespace) -> CommandResult:
@@ -565,7 +744,9 @@ def command_render(config: GenerationConfig, args: argparse.Namespace) -> Comman
         return fail(EXIT_USAGE, f"no such production {args.render!r}")
     CharacterStore(config.characters_dir).merge_into(production)
     print_screenplay(production)
-    return confirm_and_render(config, production, store, args.yes, args.output)
+    return confirm_and_render(
+        config, production, store, args.yes, args.output, resume=args.resume
+    )
 
 
 def command_self_test(config: GenerationConfig, output: Optional[Path]) -> CommandResult:
@@ -598,6 +779,7 @@ def command_self_test(config: GenerationConfig, output: Optional[Path]) -> Comma
             score_backend = renderer.score_backend
             speech_engine = renderer.speech.engine_name
             visual_backend = renderer.backend.name
+            sidecars = list(renderer.subtitle_files)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("self-test failed: %s", exc, exc_info=True)
         print(f"\n✗ self-test failed: {type(exc).__name__}: {exc}")
@@ -620,6 +802,7 @@ def command_self_test(config: GenerationConfig, output: Optional[Path]) -> Comma
         score_backend=score_backend,
         speech_engine=speech_engine,
         visual_backend=visual_backend,
+        subtitle_files=sidecars,
     )
     if silent:
         print(f"  ⚠ {silent} line(s) had NO AUDIO — run `--doctor` to see why")
@@ -686,8 +869,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--self-test", action="store_true", help="offline end-to-end check")
     parser.add_argument("--no-music", action="store_true")
     parser.add_argument("--no-captions", action="store_true")
+    parser.add_argument("--no-subtitles", action="store_true",
+                        help="skip the .srt and .vtt sidecars")
+    parser.add_argument("--no-lip-sync", action="store_true",
+                        help="skip audio-driven mouth movement")
     parser.add_argument("--no-render", action="store_true",
                         help="write the screenplay and stop")
+    parser.add_argument("--jobs", "-j", type=int, default=0, metavar="N",
+                        help="shots to render at once (0 = from the CPU count)")
+    parser.add_argument("--resume", action="store_true",
+                        help="skip a render whose output is already current")
+    parser.add_argument("--batch", nargs="?", const="accepted", metavar="STATUS",
+                        help="render every saved production with this status "
+                             "(default: accepted); use `all` for every one")
+    parser.add_argument("--import-character", nargs=2, metavar=("NAME", "IMAGE"),
+                        help="add reference art for a character")
+    parser.add_argument("--edit", metavar="ID",
+                        help="open a screenplay in $EDITOR, then offer to render it")
     parser.add_argument(
         "--llm", action="store_true", help="let a local LLM write dialogue and image prompts"
     )
@@ -728,11 +926,20 @@ def dispatch(args: argparse.Namespace) -> CommandResult:
             backend=args.backend,
             music_backend=args.music_backend,
             providers_file=args.providers_file,
+            subtitles=not args.no_subtitles,
+            lip_sync=not args.no_lip_sync,
+            jobs=args.jobs,
         )
     except ValueError as exc:
         print(f"Bad configuration: {exc}")
         return fail(EXIT_USAGE, str(exc))
 
+    if args.import_character:
+        return command_import_character(config, *args.import_character)
+    if args.edit:
+        return command_edit(config, args)
+    if args.batch:
+        return command_batch(config, args)
     if args.init_providers is not None:
         path = Path(args.init_providers) if args.init_providers else None
         return command_init_providers(config, path, args.force)
@@ -796,6 +1003,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 def _command_name(args: argparse.Namespace) -> str:
     for flag, name in (
+        ("import_character", "import-character"),
+        ("edit", "edit"),
+        ("batch", "batch"),
         ("init_providers", "init-providers"),
         ("providers", "providers"),
         ("doctor", "doctor"),

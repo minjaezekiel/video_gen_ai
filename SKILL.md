@@ -37,6 +37,7 @@ Read `capabilities` from the result before planning any work:
 | `capabilities.speech` | the film will have captions but **no voices**. Say so before rendering. |
 | `capabilities.write_dialogue` | a bare topic cannot become dialogue. Supply a script or prose instead. |
 | `capabilities.hosted_music` | the score is synthesised locally. Normal, and the default. |
+| `capabilities.native_accelerator` | renders are ~1.5x slower. Normal; nothing is unavailable. |
 
 `voices.castable` is how many distinct voices exist here: 26 on macOS, up to 36
 on Linux with espeak-ng, 0 with no synthesiser at all.
@@ -86,11 +87,19 @@ Useful flags:
 | `--llm` | let a local model invent dialogue (see below) |
 | `--no-music`, `--no-captions` | drop the score / burned-in subtitles |
 | `--no-render` | write the screenplay and stop |
+| `--jobs N` | shots to render at once (0 = from the CPU count) |
+| `--resume` | skip the render if the output is already current |
+| `--no-subtitles` | skip the `.srt` and `.vtt` sidecars |
 | `--title`, `--output` | name the film and the file |
 
 The result carries `output` (absolute path), `duration_s`, `shots`,
-`voiced_lines`, `silent_lines`, `screenplay` and the `cast` with each
-character's voice.
+`voiced_lines`, `silent_lines`, `screenplay`, `subtitles` (the `.srt` and `.vtt`
+written beside the film), `content_hash`, `audio_cache_hits`, and the `cast`
+with each character's voice.
+
+**Hand over the sidecars too.** Every render writes `.srt` and `.vtt` next to
+the MP4, from the renderer's own measured timings. If someone wants the text,
+the transcript already exists — do not re-transcribe the audio.
 
 ### Choose the input shape deliberately
 
@@ -142,6 +151,23 @@ Quality is the model's ceiling. `llama3.2:1b` writes serviceable copy and
 sometimes drifts off-brief; it will not reliably produce a two-character
 conversation. Any larger Ollama model is a drop-in upgrade via `--llm-model`.
 
+## Re-rendering cheaply
+
+```bash
+python -m video_gen --render <id> --resume --json    # skips if already current
+python -m video_gen --batch accepted --resume --json # a whole library
+```
+
+`--resume` compares a content hash of the screenplay and the settings that
+change a pixel, so it skips correctly rather than by timestamp. When it skips,
+the payload has `"skipped": true` and `"reason": "already current"` — still exit
+0. Pair it with `--batch` and a run over a library becomes safe to repeat: a
+failed run can simply be run again.
+
+Spoken lines are cached, so even a real re-render after editing one line only
+re-speaks what changed. `audio_cache_hits` in the payload says how many were
+reused.
+
 ## Reviewing and re-rendering
 
 ```bash
@@ -192,6 +218,20 @@ Without `espeak-ng` there is no synthesiser, every line falls back to timed
 silence, and renders exit **2**. With it, `--doctor` reports up to 36 castable
 voices built from espeak's own accents and variants.
 
+## Performance, if it matters
+
+`--jobs N` renders N shots at once; `0` takes it from the CPU count, which is
+the default. It is forced to 1 when the visual backend holds one model on one
+device. Threads never change a frame.
+
+For a mostly-cached re-render, `-j 1` is actually faster than auto — shots are
+nearly free once cached and thread overhead dominates. For new content, leave it
+alone.
+
+`pip install ./rust` adds an optional native accelerator worth about 1.5x. Check
+`capabilities.native_accelerator` to see whether it is in use. Never assume it
+is there; the pure-Python path is the default and produces the same pixels.
+
 ## Limits worth stating up front
 
 - **This is not Sora, Veo or Kling.** Those are datacenter models. Without the
@@ -202,6 +242,10 @@ voices built from espeak's own accents and variants.
   one image pipeline.
 - `--seconds` is a target the pacing aims at, not a guarantee; measured audio
   owns the clock, so the real length is whatever the dialogue takes to speak.
+- **Word timings in the `.vtt` are estimated**, not force-aligned. Fine for
+  highlighting; do not cut on them. The cue timings themselves are measured.
+- **Lip sync is amplitude, not visemes**, and on a wide shot it is subtle. Do
+  not describe it as speech-accurate mouth animation.
 - The Stable Diffusion path needs `pip install -r requirements-ml.txt` and has
   never been executed on the development machine. Treat it as untested until
   `verify_backends.py` passes on your hardware.

@@ -479,6 +479,7 @@ class WritersRoom:
             invented = self.invent_cast(brief, meta)
             speaking = invented
         if not speaking:
+            self.last_error = "the model invented no usable cast"
             LOGGER.info("no cast to write for; keeping the deterministic script")
             return None
 
@@ -486,12 +487,14 @@ class WritersRoom:
         draft = self.write_dialogue(brief, meta, speaking, wanted)
         draft.cast = invented
         if len(draft.lines) < MIN_DRAFT_LINES:
-            LOGGER.info(
-                "draft rejected: %d usable line(s) of %d requested (%s)",
-                len(draft.lines),
-                wanted,
-                "; ".join(draft.rejected[:3]) or "model returned nothing",
+            why = "; ".join(draft.rejected[:3]) or "the model returned nothing"
+            # Recorded, not just logged: a caller that sees `None` needs to be
+            # able to say *why* the room declined, and discarding the reason
+            # made a rejected draft indistinguishable from no model at all.
+            self.last_error = (
+                f"only {len(draft.lines)} usable line(s) of {wanted} requested: {why}"
             )
+            LOGGER.info("draft rejected: %s", self.last_error)
             return None
         draft.setting, draft.time_of_day = self.find_setting(brief)
         return draft

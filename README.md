@@ -26,6 +26,7 @@ no GPU required.
 - [Writing dialogue with a local LLM](#writing-dialogue-with-a-local-llm)
 - [Driving it from an agent](#driving-it-from-an-agent) — `--json`, exit codes
 - [Characters and voices](#characters-and-voices)
+- [Subtitles](#subtitles) · [Performance](#performance) — the native accelerator
 - [Screenplays on disk](#screenplays-on-disk)
 - [Hosted providers](#hosted-providers) — opt-in, paid, off by default
 - [Linux and containers](#linux-and-containers)
@@ -71,6 +72,22 @@ pip install -r requirements-ml.txt   # torch, diffusers, transformers (~3 GB)
 
 Swaps the procedural visuals for Stable Diffusion, and adds character identity
 conditioning and motion clips where the hardware supports them.
+
+### Optional: the native accelerator
+
+```bash
+pip install ./rust        # needs a Rust toolchain; ~20s to build
+```
+
+Rust implementations of the three per-frame hot loops, behind the same
+interface as the Pillow and NumPy ones. **Nothing requires it** — the pure
+Python path is the default and is what the test suite checks the Rust against,
+pixel for pixel. It buys about **1.5x** on a render; see
+[Performance](#performance).
+
+```bash
+python -m video_gen --doctor     # the `accelerator:` line says which is in use
+```
 
 > ⚠️ **The diffusion path has never been executed.** PyTorch publishes no macOS
 > x86_64 wheel beyond Python 3.12, so it cannot run on the machine this was built
@@ -213,7 +230,12 @@ one failure a caller cannot detect by checking whether a file appeared.
 | **Render history** | every render appends real timings to the screenplay |
 | **An agent interface** | `--json` on every command, documented exit codes |
 | **Hosted providers** | opt-in, paid score and voices; off by default, always falls back |
-| **293 tests** | 265 offline unit tests in ~13s; 28 live renders and CLI round trips |
+| **Subtitle sidecars** | `.srt` and `.vtt`, with estimated word timings for highlighting |
+| **Lip sync** | audio-driven mouths on the procedural tier, no model needed |
+| **Parallel shots** | `--jobs`; forced serial when the backend holds one model |
+| **Resume and batch** | `--resume` skips what is already current; `--batch` does a library |
+| **Native accelerator** | optional Rust for the per-frame hot loops, ~1.5x |
+| **395 tests** | 353 offline in ~36s; 42 live renders and CLI round trips |
 
 Shot types (`establishing`, `wide`, `medium`, `close`, `insert`) drive both the
 image prompt and how large characters are staged, so framing genuinely changes
@@ -234,6 +256,9 @@ python -m video_gen --cast <id>        # re-roll the voices for a production
 python -m video_gen --doctor           # capabilities + a real audio probe
 python -m video_gen --doctor --llm     # ...and a real dialogue probe
 python -m video_gen --show <id>        # print a saved screenplay
+python -m video_gen --edit <id>        # open it in $EDITOR, then re-render
+python -m video_gen --batch accepted   # render a whole library
+python -m video_gen --import-character Maya art.png
 python -m video_gen --providers        # opt-in hosted providers and their status
 python -m video_gen --init-providers   # write a providers.yaml (all tiers off)
 python -m video_gen --self-test        # offline end-to-end check
@@ -259,6 +284,10 @@ also works — it is a shim over the `video_gen` package.
 | `--backend NAME` | force a visual backend (see `--doctor`) |
 | `--music-backend NAME` | force a music backend (see `--doctor`) |
 | `--no-render` | write the screenplay and stop |
+| `--jobs N`, `-j N` | shots to render at once (0 = from the CPU count) |
+| `--resume` | skip the render if the output is already current |
+| `--no-subtitles` | skip the `.srt` and `.vtt` sidecars |
+| `--no-lip-sync` | skip audio-driven mouth movement |
 | `--json` | one JSON object on stdout; implies `--yes` |
 | `--providers-file PATH` | use a specific providers config |
 | `--no-music`, `--no-captions` | drop the score / burned-in subtitles |
@@ -494,6 +523,116 @@ Edit the file to override anything — a hand-set voice is never overwritten.
 
 ---
 
+## Subtitles
+
+Every render writes `<name>.srt` and `<name>.vtt` beside the MP4. Burned-in
+captions suit a finished film; a sidecar suits searching, translating,
+accessibility, re-cutting, and handing a video to someone who wants the text.
+
+```
+1
+00:00:00,000 --> 00:00:03,704
+MAYA: The signal is back. Same rhythm as last night.
+```
+
+The timings are not estimated. They are the speech windows the renderer
+measured *after* synthesis, offset by each shot's place on the timeline — the
+same clock the audio is mixed on. Overlapping cues are separated, and a cue too
+brief to read is extended.
+
+The `.vtt` additionally carries inline word timings, which is what lets a
+browser highlight each word as it is spoken:
+
+```
+<v Maya>The <00:00:00.321>signal <00:00:00.964>is <00:00:01.178>back.
+```
+
+**Word timings are the one estimate here**: a line's measured span divided
+across its words in proportion to their length, with a floor so a one-letter
+word still gets a readable moment. Weighting by length rather than splitting
+evenly matters — "I" and "extraordinarily" do not take the same time to say. A
+forced aligner would be better and would mean shipping an acoustic model, which
+this project exists to avoid.
+
+`--no-subtitles` skips both files.
+
+---
+
+## Lip sync
+
+Figures on the procedural tier move their mouths to the dialogue, with no model
+involved. It is on by default; `--no-lip-sync` turns it off.
+
+The mouth positions come from the same function that staged the figures, so a
+mouth cannot drift away from the face it belongs to, and the openness per frame
+is a short-window RMS of that line's synthesised audio — fast attack, slower
+release, so it snaps open and eases shut rather than flickering. Silence between
+lines closes it, which is what makes a shot/reverse-shot pair read correctly.
+
+It scales with framing: a wide shot animates a couple of hundred pixels, a close
+shot a few thousand. On a wide shot it is genuinely subtle.
+
+Only backends that report where mouths are get this, and today that is the
+procedural tier alone — `MouthAnchor` is part of the backend seam, so a future
+backend can opt in without the renderer changing.
+
+---
+
+## Performance
+
+A 5-shot screenplay rendering to 11 s of 1280x720 on an Intel Mac, 16 GB,
+CPU-only, procedural backend. Median of three runs.
+
+| | cold | re-render |
+|---|---|---|
+| v3.2 | 16.1 s | 12.9 s |
+| pure Python, `-j 1` | 16.0 s | 10.6 s |
+| pure Python, auto jobs | 13.6 s | 10.6 s |
+| native accelerator, `-j 1` | 13.8 s | **7.7 s** |
+| **native accelerator, auto jobs** | **10.4 s** | 8.7 s |
+
+Three separate changes, each aimed at something profiling pointed at rather
+than at a guess. The profile of a 43.8 s instrumented render was: encoding 33 %,
+**TTS 25 % and fully serialised**, **the Ken Burns crop and resize 20 %**, **PNG
+cache writes 15 %**, caption compositing 4 %.
+
+**Shots render in parallel.** They are independent — each synthesises its own
+dialogue and asks the backend for its own picture — and most of a shot is spent
+blocked on a TTS subprocess or inside Pillow, both of which release the GIL.
+`--jobs` sets the count; `0` takes it from the CPU count. It is **forced to 1
+when the visual backend holds one model on one device**, because concurrent
+calls would interleave on the same weights. Threads never change a frame, and
+there is a test asserting a `-j 1` and a `-j 4` render are identical.
+
+**Spoken lines are cached**, keyed by the text and everything shaping the voice.
+Re-rendering an edited screenplay re-speaks only what changed, which is why the
+re-render column drops furthest.
+
+**The native accelerator** replaces the two per-frame pixel loops: measured in
+isolation, 2.9x on the crop-and-resize and 3.7x on the caption composite, using
+rayon across cores.
+
+One honest wrinkle: on a **fully cached** re-render, `-j 1` beats auto jobs
+(7.7 s against 8.7 s). With every shot's audio and image already on disk, shots
+are nearly free and thread overhead dominates while ffmpeg is still fed one
+frame at a time. Cold renders are the common case for new content, so auto stays
+the default — pass `-j 1` if you mostly re-render.
+
+**`--resume` skips a render that is already current.**
+
+```bash
+python -m video_gen --render <id> --resume
+python -m video_gen --batch accepted --resume     # a whole library, repeatably
+```
+
+Currency is decided by a content hash, not a file timestamp. The hash covers the
+shot list, the cast's voices and exactly those settings that change a pixel — so
+editing a comment does not force a re-render, and changing `--seed` or `--preset`
+does. `--jobs` is deliberately absent from it: how many threads rendered a film
+cannot change the film.
+
+---
+
 ## Screenplays on disk
 
 Each production is markdown with YAML frontmatter in `video_scripts/`, with a
@@ -659,6 +798,8 @@ docker run --rm -v "$PWD/output:/work/output" video-gen --self-test
 | motion | AnimateDiff / SVD clips | camera moves over stills |
 | voices | neural TTS, or hosted TTS | **system voices — fully working, 26 on macOS, up to 36 on Linux** |
 | score | hosted model (opt-in, paid) | **synthesised pads per scene mood — fully working** |
+| lip sync | — | **audio-driven mouths on the procedural tier — fully working** |
+| frame throughput | — | **native accelerator, optional, ~1.5x** |
 | dialogue writing | **local LLM via Ollama — working, no GPU needed** | deterministic screenwriter |
 
 The writers' room is the one model-backed feature that needs **no GPU and no
@@ -672,13 +813,15 @@ Intel Mac, 16 GB, CPU-only, procedural backend:
 | | |
 |---|---|
 | self-test — 2 characters, 4 shots → 9.7 s of 720p | **12.4 s** |
-| 5-shot screenplay → 11.7 s of 720p | 16.8 s |
+| 5-shot screenplay → 11 s of 720p, cold | **10.4 s** |
+| the same, re-rendered after an edit | **7.7 s** |
 | vertical ad, 720×1280 | 15.5 s |
 | dialogue for a 30 s film (`--llm`, llama3.2:1b) | 8–20 s |
-| test suite — 265 offline unit tests | ~13 s |
-| test suite — everything, incl. 28 live renders | 2–6 min (image cache) |
+| test suite — 353 offline tests | ~36 s |
+| test suite — everything, incl. 42 live renders | ~3.5 min |
 
-Faster than real time without a GPU.
+Faster than real time without a GPU. See [Performance](#performance) for what
+each change bought and where it does not help.
 
 ---
 
@@ -740,10 +883,21 @@ can tell after the fact whether a given file was ever going to have sound.
 ## Tests
 
 ```bash
-pytest test.py            # 265 offline unit tests, ~13 s
-pytest test.py -m slow    # 28 live renders and CLI round trips
+pytest test.py            # 353 offline tests, ~36 s
+pytest test.py -m slow    # 42 live renders and CLI round trips, ~3.5 min
 pytest test.py -m ''      # everything
+
+VIDEO_GEN_NO_FASTPATH=1 pytest test.py -m ''   # the pure-Python path only
 ```
+
+**Both frame paths are checked against each other, not assumed equal.** Every
+accelerator test runs twice — once native, once with the extension forced off —
+and the Rust resize is compared against Pillow on eight crop and scale cases
+with a tolerance of **1 per channel**, which is the floor imposed by Pillow
+convolving in fixed point and this in f64. The caption composite has to agree
+*exactly*, because both truncate. That last run above is the one that matters
+for the default install, since that is what `pip install -r requirements.txt`
+gives you.
 
 Mocks stand in for what cannot run here: a mock visual backend covers the
 identity and motion paths, a mock LLM covers the writers' room, a mock music
@@ -797,6 +951,19 @@ streams, not about what a function returns in-process.
   correct it without touching code.
 - **The container is not built in CI.** The `Dockerfile` is checked by reading,
   and self-verifies its voices at build time, but no automated build runs it.
+- **Word-level subtitle timings are estimated**, not force-aligned. A line's
+  measured span is divided across its words by length. Good enough to drive
+  highlighting; not good enough to cut on.
+- **Lip sync is a mouth shape, not visemes.** It opens and closes with the
+  amplitude of the audio; it does not know a vowel from a consonant. On a wide
+  shot it is a few hundred pixels and genuinely subtle.
+- **The accelerator only moves pixels.** It adds no capability, and there is
+  deliberately nothing it can do that the Python path cannot — otherwise the
+  default install would be the second-class one.
+- **No GPU work is in Rust, and none is planned.** Where this project touches a
+  model, the heavy lifting is already native: Ollama is a compiled binary and
+  diffusion is PyTorch. A Rust reimplementation of either would be slower and
+  far less capable.
 
 [decision.md](decision.md) — why each part is built the way it is, plus the audit
 of the 16 bugs fixed in v1.
@@ -807,6 +974,9 @@ of the 16 bugs fixed in v1.
 
 Python 3.9+. Any OS. Seven runtime dependencies, ~200 MB installed, or ~3 GB
 with the optional model stack.
+
+The optional accelerator needs a Rust toolchain to build from source and is
+never required; `pip install -r requirements.txt` is pure Python.
 
 Developed and tested on Python 3.13 (macOS) and built in a 3.12 container;
 3.9–3.11 are declared from the syntax used and are not exercised by CI.

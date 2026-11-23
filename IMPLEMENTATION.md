@@ -28,9 +28,51 @@ Last updated: 2026-08-23 · v3 (writers' room)
 | 13. Packaging | ✅ done | `pyproject.toml`, `video-gen` entry point, `SKILL.md`, `examples/`, `Dockerfile` |
 | 14. Linux voice parity | ✅ done | espeak pool from its own listings; `-v` now actually passed |
 | 15. Hosted providers | ⚠️ **written, request shapes unverified** | config layer and every failure path tested; endpoints never called |
+| 16. Native accelerator (v3.3) | ✅ done | optional PyO3 + rayon crate for the per-frame loops; compared against Pillow to ±1 |
+| 17. Parallel shots, caches, resume | ✅ done | `--jobs`, audio cache, content-hash `--resume`, `--batch` |
+| 18. Subtitles and lip sync | ✅ done | `.srt`/`.vtt` with estimated word timings; audio-driven mouths |
 
-**Tests: 293 passing** (265 fast in ~13 s, 28 slow: live renders and CLI
-subprocess round trips; 2–6 min depending on the image cache).
+**Tests: 395 passing** (353 fast in ~36 s, 42 slow: live renders and CLI
+subprocess round trips, ~3.5 min). The whole suite also passes with
+`VIDEO_GEN_NO_FASTPATH=1`, which is the default install.
+
+### v3.3 — measure, then build
+
+The rule for this round was that nothing got optimised without a profile
+pointing at it. An instrumented 43.8 s render came out as:
+
+| stage | share |
+|---|---|
+| ffmpeg encode (frame feed) | 33 % |
+| TTS subprocess, fully serialised | 25 % |
+| Ken Burns crop + resize, per frame | 20 % |
+| PNG cache writes (zlib at level 6) | 15 % |
+| caption alpha composite | 4 % |
+
+Which is why the work was: parallel shots and an audio cache (the 25 %), a Rust
+crate for two pixel loops (the 24 %), and `compress_level=1` on cache writes
+(the 15 %). Nothing was spent on the encoder, which is ffmpeg's to own, and
+nothing on the music synthesis, which NumPy already does at C speed.
+
+Why Rust, and why only there: both pixel loops are pure functions over
+contiguous `u8` buffers with no Python object churn, which is exactly the shape
+that moves to native code well, and rayon parallelises them inside a single
+frame. Everywhere this project touches a model the heavy work is *already*
+native — Ollama is a compiled binary, diffusion is PyTorch — so a Rust
+reimplementation there would be slower and far less capable. A text-to-video
+trainer was declined for the same reason plus two harder ones: the GPU-hours and
+the dataset.
+
+The accelerator had to be optional, which constrained the design more than the
+speed did. `pip install -r requirements.txt` must stay a pure-Python install, so
+`rust/` is a separate distribution with its own `pyproject.toml`, and
+`fastpath.py` holds both implementations behind one interface. It may add no
+capability — anything only the fast path could do would make the default install
+the broken one — and the two paths are compared in the suite rather than assumed
+equal. Matching Pillow meant reimplementing its triangle filter exactly,
+including that a filter window may reach outside the crop box and is clipped
+only by the image; clamping at the crop edge instead left a band of wrong pixels
+up to 80 levels off, small in the mean and obvious in a diff.
 
 ### v3.1 — what an agent needs
 
@@ -182,6 +224,8 @@ video_gen/
   music.py         MOODS, render_bed(), score_timeline(), duck(), mood_for()
   providers.py     opt-in hosted provider config; presets, templating, extraction
   agent.py         the --json contract: payloads, exit codes, CommandResult
+  fastpath.py      the accelerator seam: native if built, Pillow/NumPy if not
+  subtitles.py     .srt and .vtt from measured timings; word-timing estimate
   render.py        FilmRenderer: shots -> frames -> timeline -> mux -> MP4
   cli.py           argparse + all commands, human and --json from one code path
   score/
@@ -198,6 +242,10 @@ video_gen/
 video_generator.py  compatibility shim
 verify_backends.py  run this on GPU hardware to test diffusion.py for the first time
 test.py             the whole suite
+
+rust/               the optional accelerator: Cargo.toml + src/lib.rs (PyO3, rayon)
+                    resize_crop, blend_box, mouth_openness — a separate
+                    distribution, so the main install needs no toolchain
 
 pyproject.toml      packaging; `video-gen` entry point, [ml] and [dev] extras
 SKILL.md            the agent-facing contract, packaged as a skill
@@ -294,6 +342,19 @@ installable on this machine. Its real `--voices` output is used as a fixture and
 a stub binary on `PATH` exercises synthesis, which is what proves `-v` is passed.
 The parsing and the pool construction are tested; the actual sound espeak makes
 is not.
+
+**The accelerator is built and tested only on this machine's target.** It is an
+abi3 wheel, so one build covers CPython 3.9+, but only macOS x86_64 has been
+compiled and run here. The fallback is what every untested platform gets, and
+that is the tested path.
+
+**Word-level subtitle timings are an estimate**, not a forced alignment: a
+line's measured span divided across its words by length. The cue timings
+themselves are measured and exact.
+
+**Lip sync is amplitude, not visemes.** It opens and closes with the audio's
+RMS; it does not know a vowel from a consonant. `say` exposes no phonemes, so
+visemes would mean a different synthesiser.
 
 **The Dockerfile is not built in CI.** It self-verifies its own voices at build
 time — `--doctor --json` must report working speech and more than one castable

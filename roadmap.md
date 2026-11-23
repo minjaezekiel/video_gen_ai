@@ -155,6 +155,56 @@ that could not be upgraded without editing the renderer.
       off leaves the cast audible rather than silent. One failure disables the
       tier for the rest of the render
 
+
+## v3.3 — performance, and the roadmap's model-free items ✅ complete
+
+Profiling an instrumented 43.8 s render first, then building only against what
+it pointed at: encoding 33 %, TTS 25 % and fully serialised, the Ken Burns crop
+and resize 20 %, PNG cache writes 15 %, caption compositing 4 %.
+
+- [x] **A native accelerator**, optional: `rust/` is a PyO3 + rayon crate
+      implementing the three per-frame hot loops. 2.9x on the crop-and-resize,
+      3.7x on the caption composite, measured in isolation. `video_gen/fastpath.py`
+      falls back to Pillow and NumPy, so `pip install -r requirements.txt` stays
+      pure Python with no toolchain
+- [x] **The two frame paths are compared, not trusted.** Pillow's exact triangle
+      filter is reimplemented, so the Rust agrees to 1 per channel across eight
+      crop and scale cases; the composite agrees exactly. Every accelerator test
+      runs twice, once with the extension forced off
+- [x] **Shots render in parallel** (`--jobs`), gated on a `parallel_safe` flag so
+      a backend holding one model on one device stays serial. A test asserts
+      `-j 1` and `-j 4` produce an identical film
+- [x] **Spoken lines are cached**, keyed on the text and everything shaping the
+      voice, which is what makes a re-render after an edit cheap
+- [x] **PNG cache writes at compression level 1** instead of Pillow's 6: a cache
+      file is read back once, and zlib was 15 % of a render
+- [x] **`.srt` and `.vtt` sidecars** from the render's own measured timings, with
+      estimated word timings for karaoke-style highlighting
+- [x] **Lip sync** on the procedural tier: mouth positions from the same function
+      that staged the figures, openness from a short-window RMS with a fast
+      attack and a slower release. `MouthAnchor` is part of the backend seam
+- [x] **`--resume`** via a content hash of everything that changes a pixel — not
+      a timestamp, so a comment edit does not force a re-render and a changed
+      `--seed` does. **`--batch`** renders a library, repeatably when paired
+- [x] **`--import-character`** and **`--edit`**, both previously half-built
+- [x] Four bugs the new tests caught: the audio cache key depended on state that
+      mutated during the first call so re-renders never hit; `content_hash`
+      hashed a speaker name that markdown round-trips as `MAYA`, so `--resume`
+      could never match; `config.style` was missing from the hash; and the
+      lip-sync envelope was parked on `self`, which parallel shots would stomp
+- [x] A rejected LLM draft now records *why*, instead of returning `None`
+      indistinguishable from having no model at all
+- [x] **395 tests**, 353 of them offline in ~36 s
+
+**Deliberately not built: a text-to-video model, in Rust or otherwise.**
+Training one needs thousands of GPU-hours and a curated dataset at WebVid-10M
+scale; Rust has no mature training stack (Candle and burn are inference-first);
+and it would contradict the premise that this runs offline on a CPU with no
+downloads. The `VisualBackend` seam is where a *pretrained* model belongs, and
+`diffusion.py` is already written against it. Rust earns its place in the
+deterministic pixel loops, where profiling put the time — not in the model
+layer, where the native work is already native.
+
 ---
 
 ## Not done — known gaps
@@ -197,13 +247,11 @@ already carried through the model, the store and `ShotRequest`.
   for `realistic`, rather than prompt conditioning alone.
 
 ### Characters
-- **Upload → character**: `--import-character name image.png` is half-built
-  (`CharacterStore.import_reference` works); wire it into the CLI and the
-  interview so a user can cast their own art.
 - **Character sheets**: generate a reference turnaround once per character and
   condition every shot on it, rather than on a single photo.
-- **Lip sync**: audio-driven mouth states for the procedural tier — a real
-  animation win that needs no model at all.
+- **Visemes rather than amplitude** for lip sync: mouth shapes driven by
+  phonemes, so a vowel and a consonant differ. Needs the TTS to expose
+  phonemes, which `say` does not and espeak does.
 
 ### Audio
 - **Verify the hosted providers against real accounts.** Every request shape in
@@ -212,14 +260,16 @@ already carried through the model, the store and `ShotRequest`.
   `urlopen` replaced, but a renamed field would only show up against a live key.
 - **MusicGen-small** as a *local* `MusicBackend`, cached per mood — the seam now
   exists, so this is an added file rather than a change to the renderer.
-- **Word-level timing** from the TTS to drive per-word caption highlighting.
+- **Force-aligned word timings**, replacing the length-weighted estimate the
+  `.vtt` carries now. Needs an acoustic model.
 - **Sound effects** keyed off shot actions.
 
 ### Output
-- **`.srt` sidecar** — timings are already computed, this is nearly free, and an
-  agent handing a video to a human usually wants one.
-- **Batch render** every `accepted` production.
-- **Resume**: skip shots whose cached image and audio are both current.
+- **Frame prefetch**: ffmpeg is still fed one frame at a time, which is the
+  largest remaining serial cost. Rendering frames ahead into a bounded queue is
+  the next real speedup, and bigger than anything left in the per-frame loops.
+- **Burn the sidecar's word timings into the captions**, so the on-screen
+  subtitle highlights as it is spoken rather than appearing whole.
 
 ### Writing
 - **Dialogue alongside narration**, so a prose story can gain speech without
@@ -234,5 +284,4 @@ already carried through the model, the store and `ShotRequest`.
   neither is exercised: espeak is covered by a stub binary and a fixture, and the
   container is checked by reading rather than by building.
 - **Style references**: seed a new production's look from a past accepted one.
-- **`--edit`**: open the screenplay in `$EDITOR` before rendering.
 - **Web UI**, if the CLI stops being enough.
